@@ -5,6 +5,19 @@ operators.** Most experiment trackers are dashboards a human reads. kikai is an
 HTTP control plane an agent *drives* — launch training, watch it, judge it, and
 iterate — over a plain-file registry you can `cat`, diff, and grep.
 
+**Where it came from.** It started with a reliability problem: letting an agent
+manage training by hand-composing `ssh host "docker run …"` commands fails
+constantly — heredocs, nested quotes, and `${VAR}` expansion get mangled more
+often than not. kikai removes hand-composed shell entirely: the agent sends one
+typed JSON operation and the server builds and runs the command. No heredocs, no
+quoting, no shell.
+
+**Fewer tokens, too.** In a measured MNIST-scale resume-and-inspect task, driving
+it through kikai used **~1.4× fewer tokens** than the same task through a 40-tool
+MLflow MCP server (6.1k → ~4.3k), and carries **none of the ~5,600-token
+tool-schema tax** an MCP loads into context every session — full method and
+caveats in [docs/BENCHMARK.md](docs/BENCHMARK.md).
+
 **Why you'd want it:**
 
 - 🔁 **Iterate in one call, not sixty lines** — `submit-from` inherits a run's whole config; change one variable, keep the lineage.
