@@ -62,6 +62,7 @@ server, end to end:
 
 ```bash
 # 1. start the server over a fresh registry (localhost-only by default)
+mkdir -p /tmp/kikai-demo
 kikai server start --projects-root /tmp/kikai-demo &
 
 # 2. an agent's view of how to drive it
@@ -99,7 +100,7 @@ it anywhere.
 
 ## Reference
 
-The framework examples under `examples/` are fixtures. Real adopter state should live under an adopter-owned registry root such as `<adopter-repo>/.kikai/`.
+`examples/` ships the dependency-free [toy trainer](examples/toy_trainer/) (a full trainer-contract reference) plus a couple of standalone operation JSON samples. Real adopter state should live under an adopter-owned registry root such as `<adopter-repo>/.kikai/`; the `path/to/project` in the walkthroughs below is a placeholder for that root.
 
 Docker container definitions live under `containers/*.yaml`. These records define the canonical desired container names, images, roles, mounts, GPU expectation, and healthcheck hints so agents do not guess which training, watcher, or TensorBoard container to use. Docker lifecycle actions are side-effect operations driven by one operation JSON (see below).
 
@@ -691,8 +692,12 @@ The dashboard shows the project concept and current state, decision cards, per-e
 Everything above is also reachable over HTTP: `kikai server start --projects-root <dir>
 --port 8300` serves every project registry under one endpoint — project CRUD, typed run
 submission (agents never touch docker/ssh), columnar metrics, artifact streaming, and a
-no-build web dashboard at `/`. Agents should start from `GET /v1/skill.md` (served by
-the same process, so it cannot drift). Every JSON response is the CLI envelope; errors
+no-build web dashboard at `/`. Beyond basic CRUD the API includes differential
+submission (`submit-from/{parent}`), offline probes (`probe-from/{parent}`), a live
+control plane (`POST .../control`), run comparison (`compare?runs=`), long-poll status,
+and one-call session resume (`brief` / `journal`) — all documented in the served skill
+guide. Agents should start from `GET /v1/skill.md` (served by the same process, so it
+cannot drift). Every JSON response is the CLI envelope; errors
 carry stable codes. Single-worker only; registry writes rely on process-local atomicity.
 Optional flags: `--host 0.0.0.0` (must be explicit — see [SECURITY.md](SECURITY.md)),
 `--auth-token` / `KIKAI_AUTH_TOKEN` (require a bearer token on every request but
