@@ -1040,3 +1040,79 @@ def test_submit_clears_stale_control_and_warns_on_truncating_cap(
     )
     assert resp.status_code == 404
     assert resp.json()["errors"][0]["code"] == "run.run_dir_missing"
+
+
+def test_probe_from_refuses_unrelocated_run_dir_endpoint(tmp_path: Path, monkeypatch) -> None:
+    """End-to-end: a parent whose run_dir naming differs from its run name must be
+    refused at the endpoint with 422 — locks in that the guard is WIRED, not just
+    that the helper works."""
+    client = make_client(tmp_path)
+    prepare_project(tmp_path, client)
+    fake, _, set_control = write_fake_docker(tmp_path)
+    monkeypatch.setenv("KIKAI_DOCKER_BIN", str(fake))
+    set_container_env(monkeypatch, tmp_path)
+    # parent run_dir uses a DIFFERENT token than the run name -> rebind can't relocate
+    submit(
+        client,
+        args=["--run-dir", "${CONTAINER_RUNS_ROOT}/legacy_renderer/run", "--max-steps", "100"],
+        run_dir="${EXAMPLE_RUNS_ROOT}/legacy_renderer/run",
+    )
+    client.post("/v1/projects/example_new/runs/example_run_a/stop")
+    set_control(exists=False)
+    ckpt = tmp_path / "host_runs" / "legacy_renderer" / "run" / "checkpoints"
+    ckpt.mkdir(parents=True)
+    (ckpt / "best_step_000080_loss1p0.pt").write_bytes(b"x")
+
+    resp = client.post(
+        "/v1/projects/example_new/runs/example_probe_x/probe-from/example_run_a",
+        json={"question": "would this corrupt the parent?", "probe_steps": 10},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["errors"][0]["code"] == "run.run_dir_relocation_invalid"
+
+    # with an explicit fresh run_dir + matching --run-dir, it launches
+    ok = client.post(
+        "/v1/projects/example_new/runs/example_probe_y/probe-from/example_run_a",
+        json={"question": "fresh dir", "probe_steps": 10,
+              "overrides": {"run_dir": "${EXAMPLE_RUNS_ROOT}/example_probe_y/run",
+                            "args_set": {"--run-dir": "${CONTAINER_RUNS_ROOT}/example_probe_y/run"}}},
+    )
+    assert ok.status_code == 201, ok.text
+
+
+def test_submit_from_refuses_unrelocated_run_dir(tmp_path: Path, monkeypatch) -> None:
+    """A parent whose run_dir naming differs from its run name cannot be rebound;
+    the child must be refused, not silently pointed at the parent's dir."""
+    import pytest
+
+    from kikai_lab.operation import OperationError
+    from kikai_lab.server.submit import ensure_run_dir_relocated
+
+    # run_dir uses a DIFFERENT token than the run name -> rebind is a no-op
+    parent = {
+        "run_dir": "${HOST}/legacy_renderer_dir/run",
+        "args": ["--run-dir", "${C}/legacy_renderer_dir/run", "--max-steps", "100"],
+    }
+    # child inherited the parent's run_dir unchanged (rebind couldn't touch it)
+    with pytest.raises(OperationError) as exc:
+        ensure_run_dir_relocated(parent, dict(parent), "child_run")
+    assert exc.value.code == "run.run_dir_relocation_invalid"
+
+    # only the trainer arg collides (managed run_dir was relocated) -> still refused
+    child_arg_only = {
+        "run_dir": "${HOST}/child_run/run",  # relocated
+        "args": ["--run-dir", "${C}/legacy_renderer_dir/run"],  # NOT relocated
+    }
+    with pytest.raises(OperationError) as exc:
+        ensure_run_dir_relocated(parent, child_arg_only, "child_run")
+    assert exc.value.code == "run.run_dir_relocation_invalid"
+
+    # a genuinely relocated child passes
+    good = {
+        "run_dir": "${HOST}/child_run/run",
+        "args": ["--run-dir", "${C}/child_run/run"],
+    }
+    ensure_run_dir_relocated(parent, good, "child_run")  # no raise
+
+    # a parent with no run_dir (unmanaged) is a no-op
+    ensure_run_dir_relocated({"args": []}, {"args": []}, "child_run")

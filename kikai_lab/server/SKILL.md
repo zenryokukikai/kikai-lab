@@ -130,6 +130,11 @@ curl -X POST $BASE/projects/example_proj/runs/example_run_002/submit-from/exampl
   incl. retention / qc / evaluations / metric_checks) is reconstructed from the
   registry, every occurrence of the parent run name (run_dir, qc paths, ...) is
   rebound to the child name, then your `overrides` apply.
+- **If the parent's run_dir does not contain its run name** (a different naming
+  scheme, e.g. run `example_run` with run_dir `.../example_renderer/run`), the
+  rebind cannot relocate it and the call is REFUSED (`run.run_dir_not_relocated`)
+  — writing into the parent's dir would corrupt it. Override `run_dir` and the
+  trainer's run-dir arg to a fresh path.
 - `overrides.args_set`: upserts flag values; `null` REMOVES a flag and all its
   values; `""` strips values to a bare flag; a JSON list sets a multi-value (nargs)
   flag. Repeated flags: only the first occurrence is touched; values starting

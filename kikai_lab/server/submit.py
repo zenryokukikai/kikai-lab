@@ -446,6 +446,41 @@ def arg_value_after(args: list[Any], flag: str) -> str | None:
     return None
 
 
+def ensure_run_dir_relocated(
+    parent_body: dict[str, Any],
+    child_body: dict[str, Any],
+    run_name: str,
+    run_dir_arg: str = "--run-dir",
+) -> None:
+    """Fail closed if the child would write into the PARENT's run_dir.
+
+    rebind_run_name only rewrites occurrences of the parent's RUN NAME. When a
+    run_dir uses a different naming scheme than the run name (e.g. run name
+    ``example_run_v2`` but run_dir ``.../example_renderer/run``), the
+    rebind is a no-op and the child silently inherits the parent's run_dir —
+    appending to its metrics, overwriting its checkpoints, and (via the child's
+    retention) DELETING them. Require an explicit run_dir relocation instead."""
+    parent_rd = parent_body.get("run_dir")
+    if parent_rd and child_body.get("run_dir") == parent_rd:
+        raise OperationError(
+            "run.run_dir_relocation_invalid",
+            "the child run_dir equals the parent's — the parent's run_dir naming "
+            "does not contain its run name, so rebinding could not relocate it. "
+            "Writing there would corrupt the parent (metrics/checkpoints/retention). "
+            "Pass an explicit run_dir override (and the matching trainer run-dir arg).",
+            {"run_name": run_name, "run_dir": parent_rd},
+        )
+    parent_arg = arg_value_after(parent_body.get("args") or [], run_dir_arg)
+    if parent_arg and arg_value_after(child_body.get("args") or [], run_dir_arg) == parent_arg:
+        raise OperationError(
+            "run.run_dir_relocation_invalid",
+            f"the child's {run_dir_arg} still points at the parent's run dir; "
+            "rebinding could not relocate it (run_dir naming != run name). Override "
+            f"{run_dir_arg} (and run_dir) to a fresh path.",
+            {"run_name": run_name, run_dir_arg: parent_arg},
+        )
+
+
 def build_submit_router(config: ServerConfig) -> APIRouter:
     router = APIRouter(tags=["submit"])
 
@@ -732,6 +767,10 @@ def build_submit_router(config: ServerConfig) -> APIRouter:
                     rebound[field], parent_run, run_name, sibling_runs=siblings
                 )
         merged = apply_overrides(rebound, overrides)
+        # submit-from only knows the conventional "--run-dir" flag for the arg-level
+        # check; other trainer flag names rely on the managed-run_dir check (which
+        # catches the primary retention/reconciler danger).
+        ensure_run_dir_relocated(parent_body, merged, run_name)
         merged["dry_run"] = bool(body.get("dry_run"))
         return do_submit(
             project_id,
@@ -834,6 +873,9 @@ def build_submit_router(config: ServerConfig) -> APIRouter:
             managed["retention"] = {"keep_latest": 1, "keep_best": 1}
         merged["managed"] = managed
         merged["resume"] = {"fresh_no_resume": False}
+        # a probe that writes into the parent's run_dir would corrupt the very
+        # checkpoint it resumed from — and probe retention (1+1) would prune it.
+        ensure_run_dir_relocated(parent_body, merged, run_name, run_dir_arg)
         merged["dry_run"] = bool(body.get("dry_run"))
         return do_submit(
             project_id,
