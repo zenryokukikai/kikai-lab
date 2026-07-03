@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "kind": "kikai_operation",
+  "request": {
+    "operation": "container_python_version_smoke",
+    "project_root": "examples/example_project",
+    "target_id": "example_run_training_python_version_smoke",
+    "adapter": "docker_exec",
+    "container_id": "example_run_training",
+    "docker_host": "env:KIKAI_DOCKER_HOST",
+    "workdir": "env:CONTAINER_EXAMPLE_ENGINE_ROOT",
+    "env": {
+      "PYTHONUNBUFFERED": "1"
+    },
+    "argv": [
+      "python",
+      "--version"
+    ]
+  }
+}

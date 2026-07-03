@@ -1,0 +1,48 @@
+{
+  "$id": "https://kikai-lab.local/schemas/delivery_target.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "external_refs": {
+      "items": {
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "kind": {
+      "enum": [
+        "discord_webhook"
+      ]
+    },
+    "project_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "status": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "target_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "webhook_url": {
+      "description": "Webhook URL or env:<NAME> reference. Secrets should use env refs, not literal URLs in committed registries.",
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "target_id",
+    "kind",
+    "webhook_url"
+  ],
+  "title": "Kikai Lab Delivery Target",
+  "type": "object"
+}

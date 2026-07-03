@@ -1,0 +1,66 @@
+{
+  "$id": "https://kikai-lab.local/schemas/artifact_delivery.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "artifact_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "delivered_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "delivery_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "external_refs": {
+      "items": {
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "file_path": {
+      "type": "string"
+    },
+    "http_status": {
+      "type": "integer"
+    },
+    "message": {
+      "type": "string"
+    },
+    "project_id": {
+      "type": "string"
+    },
+    "response_body": {
+      "type": "string"
+    },
+    "schema_version": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "status": {
+      "enum": [
+        "delivered",
+        "failed"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "target_id": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "delivery_id",
+    "artifact_id",
+    "target_id",
+    "status"
+  ],
+  "title": "Kikai Lab Artifact Delivery",
+  "type": "object"
+}

@@ -1,0 +1,175 @@
+{
+  "$id": "https://kikai-lab.local/schemas/run.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "conclusions": {
+      "items": {
+        "properties": {
+          "at": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "array"
+          },
+          "next_run": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "verdict": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "at",
+          "verdict",
+          "summary"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "data_source_refs": {
+      "items": {
+        "additionalProperties": true,
+        "allOf": [
+          {
+            "if": {
+              "anyOf": [
+                {
+                  "not": {
+                    "required": [
+                      "data_source_id"
+                    ]
+                  }
+                },
+                {
+                  "properties": {
+                    "data_source_id": {
+                      "type": "null"
+                    }
+                  },
+                  "required": [
+                    "data_source_id"
+                  ]
+                }
+              ]
+            },
+            "then": {
+              "properties": {
+                "required": {
+                  "const": false
+                }
+              },
+              "required": [
+                "required"
+              ]
+            }
+          }
+        ],
+        "properties": {
+          "data_source_id": {
+            "anyOf": [
+              {
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "role": {
+            "enum": [
+              "train_manifest",
+              "eval_manifest",
+              "face_cache",
+              "source_audio",
+              "source_video",
+              "tts_corpus",
+              "initial_checkpoint",
+              "resume_checkpoint",
+              "teacher_checkpoint",
+              "reference_media",
+              "preview_audio",
+              "metrics_log",
+              "status_input"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "external_refs": {
+      "items": {
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "fresh_no_resume": {
+      "type": "boolean"
+    },
+    "probe": {
+      "description": "present when this run is a PROBE: short, checkpoint-warm-started, answers one question; exempt from fresh-run reproducibility rules",
+      "properties": {
+        "budget_steps": {
+          "type": "integer"
+        },
+        "parent_run": {
+          "type": "string"
+        },
+        "question": {
+          "type": "string"
+        },
+        "resume_checkpoint": {
+          "type": "string"
+        },
+        "resume_step": {
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "project_id": {
+      "type": "string"
+    },
+    "run_name": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "schema_version": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "status": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "verdict": {
+      "enum": [
+        "adopted",
+        "rejected",
+        "superseded",
+        "inconclusive"
+      ]
+    }
+  },
+  "required": [
+    "schema_version",
+    "run_name"
+  ],
+  "title": "Kikai Lab Run",
+  "type": "object"
+}

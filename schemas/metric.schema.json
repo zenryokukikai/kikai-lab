@@ -1,0 +1,36 @@
+{
+  "$id": "https://kikai-lab.local/schemas/metric.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "external_refs": {
+      "items": {
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "metric_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "project_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "status": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "metric_id"
+  ],
+  "title": "Kikai Lab Metric",
+  "type": "object"
+}

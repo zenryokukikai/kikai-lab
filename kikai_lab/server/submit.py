@@ -1,0 +1,1206 @@
+"""Typed run submission, stop, and the generic operations escape hatch.
+
+Submission is the heart of the agent workflow: the agent names registered pieces
+(container profile, bundle, entrypoint, data sources) and the server constructs the
+``script_bundle_run`` operation itself and executes it in-process (trusted caller, same
+precedent as the reconciler — no guard-receipt dance, because the request never exists
+as a human-editable file). ``runs/<run_name>.yaml`` records the submission with its
+canonical ``request_sha256``; ``managed_runs/<run_name>.yaml`` is auto-created so the
+unmodified reconciler takes over QC / retention / finalize. The agent never sees docker.
+"""
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Annotated, Any
+
+from fastapi import APIRouter, Body, Query
+from fastapi.responses import JSONResponse
+
+from kikai_lab.envelope import error, next_action
+from kikai_lab.operation import (
+    OperationError,
+    docker_inspect_by_name,
+    docker_name_from_container,
+    docker_rm_force,
+    execute_operation,
+    load_container_record,
+    load_script_bundle,
+    operation_data_source_ref_preflight,
+    request_sha256,
+    resolve_text_ref,
+    script_bundle_entrypoint_argv,
+)
+from kikai_lab.server.app import envelope_response
+from kikai_lab.server.registry import (
+    WRITE_LOCK,
+    ServerConfig,
+    append_journal,
+    atomic_write_json,
+    atomic_write_yaml,
+    load_yaml_record,
+    require_active_project,
+    require_project,
+    require_safe_id,
+    utc_now_text,
+    validate_record_schema,
+)
+from kikai_lab.server.runs import load_managed_run_optional, require_run_record
+
+# Declared statuses a same-body resubmit may relaunch/adopt from: a failed launch,
+# or a crash between docker starting and the final record write (H2 recovery).
+SUBMISSION_RETRYABLE_DECLARED = ("submit_failed", "submitting")
+
+
+def build_submit_op(
+    project_root: Path, run_name: str, body: dict[str, Any]
+) -> dict[str, Any]:
+    request: dict[str, Any] = {
+        "adapter": "script_bundle_run",
+        "operation": f"{run_name}_submit",
+        "project_root": str(project_root),
+        "bundle_id": body["bundle_id"],
+        "container_id": body["container_id"],
+        "entrypoint": body["entrypoint"],
+        "detach": True,
+        "args": list(body.get("args") or []),
+        "env": dict(body.get("env") or {}),
+    }
+    request["data_source_refs"] = list(body.get("data_source_refs") or [])
+    return {"kind": "kikai_operation", "schema_version": 1, "request": request}
+
+
+def preserve_analysis(run_path: Path, record: dict[str, Any]) -> dict[str, Any]:
+    """Carry conclusions/verdict from the existing record into a rebuilt one.
+
+    submission_record() rebuilds the run record from the request body; without this,
+    a retry or the post-launch status write would silently erase the append-only
+    analysis trail — the exact value the conclusion endpoint exists to keep."""
+    if run_path.is_file():
+        try:
+            existing = load_yaml_record(run_path, kind="run")
+        except OperationError:
+            return record
+        for key in ("conclusions", "verdict"):
+            if key in existing and key not in record:
+                record[key] = existing[key]
+    return record
+
+
+def submission_record(
+    run_name: str,
+    body: dict[str, Any],
+    sha: str,
+    *,
+    status: str,
+    lineage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "run_name": run_name,
+        "status": status,
+        "submission": {
+            "at": utc_now_text(),
+            "request_sha256": sha,
+            "bundle_id": body["bundle_id"],
+            "container_id": body["container_id"],
+            "entrypoint": body["entrypoint"],
+            "args": list(body.get("args") or []),
+            "env": dict(body.get("env") or {}),
+            "host_ref": body.get("host_ref") or "local",
+        },
+    }
+    if body.get("experiment_id"):
+        record["experiment_id"] = body["experiment_id"]
+    if lineage:
+        record["submission"]["parent_run"] = lineage.get("parent_run")
+        record["submission"]["overrides"] = lineage.get("overrides") or {}
+        if lineage.get("probe"):
+            record["probe"] = lineage["probe"]
+    if body.get("run_dir"):
+        record["submission"]["run_dir"] = body["run_dir"]
+    if body.get("resume") is not None:
+        record["fresh_no_resume"] = bool(body["resume"].get("fresh_no_resume", False))
+    record["data_source_refs"] = list(body.get("data_source_refs") or [])
+    return record
+
+
+def validate_submission_pieces(
+    config: ServerConfig, path: Path, body: dict[str, Any]
+) -> None:
+    """Fail-closed reference checks so a typo dies at submit time, not launch time."""
+    host_ref = body.get("host_ref")
+    if host_ref not in (None, "local", config.host_id):
+        raise OperationError(
+            "operation.host_not_local",
+            "this server only launches on its own host in v1; "
+            "use the ssh fallback for other hosts",
+            {"host_ref": host_ref, "host_id": config.host_id},
+        )
+    container = load_container_record(path, body["container_id"])
+    docker_name_from_container(container, body["container_id"])
+    bundle, _ = load_script_bundle(path, body["bundle_id"])
+    script_bundle_entrypoint_argv(bundle, body["bundle_id"], body["entrypoint"])
+    experiment_id = body.get("experiment_id")
+    if experiment_id and not (path / "experiments" / f"{experiment_id}.yaml").is_file():
+        raise OperationError(
+            "experiment.not_found",
+            f"submission names an unregistered experiment '{experiment_id}'",
+            {"experiment_id": experiment_id},
+        )
+    managed = body.get("managed")
+    if managed is not None and not body.get("run_dir"):
+        raise OperationError(
+            "run.record_invalid",
+            "managed submissions require run_dir (the daemon-local run directory)",
+            {"run_name": body.get("run_name", "")},
+        )
+
+
+def managed_run_record(run_name: str, body: dict[str, Any]) -> dict[str, Any]:
+    managed = body.get("managed") or {}
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "managed_run",
+        "run_id": run_name,
+        "run_dir": body["run_dir"],
+        "training_container_id": body["container_id"],
+    }
+    if body.get("experiment_id"):
+        # checkpoint_retention falls back to the experiment's retention block via
+        # managed_run.experiment_id — omit it and inheritance silently never happens.
+        record["experiment_id"] = body["experiment_id"]
+    for key in (
+        "max_step",
+        "poll_interval_sec",
+        "lifecycle",
+        "delivery_target_id",
+        "qc_artifacts_dir",
+    ):
+        if managed.get(key) is not None:
+            record[key] = managed[key]
+    for key in ("retention", "qc_op_template", "qc_op", "evaluations", "metric_checks"):
+        if managed.get(key) is not None:
+            record[key] = managed[key]
+    validate_record_schema(record, "managed_run", kind="managed_run")
+    return record
+
+
+def reconstruct_submit_body(
+    project_root: Path, parent_run: str
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """The parent's full submit body, rebuilt from its run record + managed_run,
+    plus wire-level warnings about anything that could not be faithfully rebuilt."""
+    run_path = project_root / "runs" / f"{parent_run}.yaml"
+    if not run_path.is_file():
+        raise OperationError(
+            "run.not_found",
+            f"no parent run '{parent_run}' to inherit from",
+            {"run_name": parent_run},
+        )
+    record = load_yaml_record(run_path, kind="run")
+    submission = record.get("submission") or {}
+    if not submission.get("bundle_id"):
+        raise OperationError(
+            "run.record_invalid",
+            "parent run has no submission block (hand-written record?) — "
+            "submit-from needs an API-submitted parent",
+            {"run_name": parent_run},
+        )
+    warnings: list[dict[str, Any]] = []
+    if "env" not in submission:
+        # records written before env persistence: "inherit everything" would be
+        # silently false for the environment — say so on the wire.
+        warnings.append(
+            error(
+                "run.parent_env_unrecorded",
+                "parent predates env recording; env reconstructed as empty — "
+                "pass env in overrides if the parent used one",
+                blocking=False,
+                details={"parent_run": parent_run},
+            )
+        )
+    body: dict[str, Any] = {
+        "container_id": submission.get("container_id"),
+        "bundle_id": submission.get("bundle_id"),
+        "entrypoint": submission.get("entrypoint"),
+        "args": list(submission.get("args") or []),
+        "env": dict(submission.get("env") or {}),
+        "host_ref": submission.get("host_ref") or "local",
+    }
+    if record.get("experiment_id"):
+        body["experiment_id"] = record["experiment_id"]
+    if record.get("data_source_refs"):
+        body["data_source_refs"] = record["data_source_refs"]
+    if "fresh_no_resume" in record:
+        body["resume"] = {"fresh_no_resume": bool(record["fresh_no_resume"])}
+    if submission.get("run_dir"):
+        body["run_dir"] = submission["run_dir"]
+    managed_path = project_root / "managed_runs" / f"{parent_run}.yaml"
+    if managed_path.is_file():
+        managed = load_yaml_record(managed_path, kind="managed_run")
+        body["managed"] = {
+            k: managed[k]
+            for k in (
+                "max_step",
+                "poll_interval_sec",
+                "lifecycle",
+                "delivery_target_id",
+                "retention",
+                "qc_op_template",
+                "qc_op",
+                "qc_artifacts_dir",
+                "evaluations",
+                "metric_checks",
+            )
+            if k in managed
+        }
+    return body, warnings
+
+
+ID_TOKEN = re.compile(r"[A-Za-z0-9_.\-]+")
+
+
+def rebind_run_name(
+    value: Any, parent: str, child: str, *, sibling_runs: frozenset[str] = frozenset()
+) -> Any:
+    """Replace the parent run's name with the child's in every string of the body —
+    run_dir, QC out-prefixes, operation names, labels.
+
+    Plain substring replacement corrupts references to OTHER runs whose names embed
+    the parent's (run_1 inside run_10's checkpoint path). So the parent name only
+    matches when not flanked by alphanumerics: run_1 never matches inside run_10,
+    while derived names (run_1_qc_000500) still rebind. The remaining ambiguity —
+    a string token that is itself ANOTHER registered run extending the parent with a
+    delimiter (parent example_run vs a referenced sibling example_run_v2) — is fail-closed:
+    422, override that field explicitly."""
+    occurrence = re.compile(
+        rf"(?<![A-Za-z0-9]){re.escape(parent)}(?![A-Za-z0-9])"
+    )
+    # only siblings whose own name embeds the parent can be corrupted by the
+    # substitution — guard those as boundary-occurrences INSIDE the token, so a
+    # sibling's derived artifacts (run_1-old_ckpt for sibling run_1-old) are
+    # protected too, not just exact-name tokens
+    risky_siblings = [
+        re.compile(rf"(?<![A-Za-z0-9]){re.escape(s)}(?![A-Za-z0-9])")
+        for s in sibling_runs
+        if s != parent and occurrence.search(s)
+    ]
+
+    def rebind_token(match: re.Match[str]) -> str:
+        token = match.group()
+        if not occurrence.search(token):
+            return token
+        for sibling_pattern in risky_siblings:
+            if sibling_pattern.search(token):
+                raise OperationError(
+                    "run.rebind_invalid",
+                    "inherited body references another registered run whose name "
+                    "embeds the parent's — rebinding would corrupt it; override "
+                    "that field explicitly in overrides",
+                    {"token": token, "parent_run": parent},
+                )
+        return occurrence.sub(child, token)
+
+    def walk(node: Any) -> Any:
+        if isinstance(node, str):
+            return ID_TOKEN.sub(rebind_token, node)
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+        if isinstance(node, dict):
+            return {k: walk(v) for k, v in node.items()}
+        return node
+
+    return walk(value)
+
+
+def apply_overrides(body: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    """Merge caller overrides onto the inherited body.
+
+    Special forms: ``args_set`` upserts flag values ({"--vgg-weight": "5.0"}; a null
+    value REMOVES the flag and ALL its values, "" strips values leaving a bare flag,
+    a list sets a multi-value (nargs) flag), everything else replaces the top-level
+    key (``managed`` merges one level deep). Only the first occurrence of a repeated
+    flag is touched; values that themselves start with "--" cannot be expressed —
+    replace ``args`` wholesale for those."""
+
+    def as_arg(item: Any) -> str:
+        if item is True:
+            return "true"
+        if item is False:
+            return "false"
+        return str(item)
+
+    def as_values(flag_value: Any) -> list[str]:
+        if flag_value == "":
+            return []
+        if isinstance(flag_value, list):
+            return [as_arg(v) for v in flag_value]
+        return [as_arg(flag_value)]
+
+    merged = dict(body)
+    for key, value in overrides.items():
+        if key == "args_set":
+            args = list(merged.get("args") or [])
+            for flag, flag_value in (value or {}).items():
+                # equals-form occurrences (--flag=value) are superseded first, so an
+                # upsert/remove owns the flag regardless of the parser's precedence
+                # (otherwise "the server's injection wins" is parser-conditional)
+                args = [a for a in args if not str(a).startswith(f"{flag}=")]
+                if flag in args:
+                    idx = args.index(flag)
+                    end = idx + 1  # consume ALL of a nargs flag's values, not just one
+                    while end < len(args) and not str(args[end]).startswith("--"):
+                        end += 1
+                    if flag_value is None:
+                        del args[idx:end]
+                    else:
+                        args[idx + 1 : end] = as_values(flag_value)
+                elif flag_value is not None:
+                    args.append(flag)
+                    args.extend(as_values(flag_value))
+            merged["args"] = args
+        elif (
+            key == "managed"
+            and isinstance(value, dict)
+            and isinstance(merged.get("managed"), dict)
+        ):
+            merged["managed"] = {**merged["managed"], **value}
+        else:
+            merged[key] = value
+    return merged
+
+
+def resolve_parent_checkpoint(
+    config: ServerConfig, project_root: Path, parent_run: str, which: Any
+) -> tuple[str, int]:
+    """(filename, step) of the parent checkpoint a probe warm-starts from.
+
+    which: "best" (newest best_step_*; the curated family carries the step in its
+    name — best_checkpoint.pt does not, and the server will not unpickle weights;
+    FALLS BACK to the newest periodic checkpoint_step_* when no best_step_* exists),
+    "latest" (newest checkpoint_step_*), or an int step (exact checkpoint_step match).
+    Resolution is server-side and fail-closed: no checkpoint, no launch; filenames
+    outside the safe charset never reach argv."""
+    from kikai_lab.operation import checkpoint_step_from_name
+    from kikai_lab.server.runs import resolved_run_dir
+
+    managed = load_managed_run_optional(project_root, parent_run)
+    run_dir = resolved_run_dir(project_root, parent_run, managed, config)
+    ckpt_dir = Path(run_dir) / "checkpoints" if run_dir is not None else None
+    if ckpt_dir is None or not ckpt_dir.is_dir():
+        raise OperationError(
+            "run.probe_checkpoint_missing",
+            "parent run has no resolvable checkpoints directory",
+            {"parent_run": parent_run},
+        )
+
+    def family(prefix: str) -> list[tuple[int, str]]:
+        out = []
+        for f in ckpt_dir.glob(f"{prefix}_*.pt"):
+            step = checkpoint_step_from_name(f)
+            if step is not None:
+                out.append((step, f.name))
+        return sorted(out)
+
+    candidates: list[tuple[int, str]]
+    if which in (None, "best"):
+        candidates = family("best_step") or family("checkpoint_step")
+    elif which == "latest":
+        candidates = family("checkpoint_step")
+    elif isinstance(which, int) and not isinstance(which, bool):
+        candidates = [(s, n) for s, n in family("checkpoint_step") if s == int(which)]
+    else:
+        raise OperationError(
+            "run.probe_checkpoint_invalid",
+            "checkpoint must be 'best', 'latest', or an integer step",
+            {"checkpoint": which},
+        )
+    if not candidates:
+        raise OperationError(
+            "run.probe_checkpoint_missing",
+            "no matching parent checkpoint for the probe to warm-start from",
+            {"parent_run": parent_run, "checkpoint": which},
+        )
+    step, name = candidates[-1]
+    if not re.fullmatch(r"[A-Za-z0-9._\-]+", name):
+        raise OperationError(
+            "run.probe_checkpoint_invalid",
+            "checkpoint filename contains characters unsafe for argv/env expansion",
+            {"name": name},
+        )
+    return name, step
+
+
+def arg_value_after(args: list[Any], flag: str) -> str | None:
+    """Value of ``--flag value`` or ``--flag=value`` (first occurrence)."""
+    items = [str(a) for a in args]
+    for i, item in enumerate(items):
+        if item == flag:
+            if i + 1 < len(items) and not items[i + 1].startswith("--"):
+                return items[i + 1]
+            return None
+        if item.startswith(f"{flag}="):
+            return item[len(flag) + 1 :]
+    return None
+
+
+def build_submit_router(config: ServerConfig) -> APIRouter:
+    router = APIRouter(tags=["submit"])
+
+    @router.post("/projects/{project_id}/runs/{run_name}/submit")
+    def run_submit(
+        project_id: str,
+        run_name: str,
+        body: Annotated[dict[str, Any], Body()] = ...,
+    ) -> JSONResponse:
+        return do_submit(project_id, run_name, body, None)
+
+    def do_submit(
+        project_id: str,
+        run_name: str,
+        body: dict[str, Any],
+        _lineage: dict[str, Any] | None,
+        warnings: list[dict[str, Any]] | None = None,
+    ) -> JSONResponse:
+        path = require_active_project(config, project_id)
+        run_name = require_safe_id(run_name, kind="run")
+        if not isinstance(body, dict):
+            raise OperationError("run.record_invalid", "body must be a JSON object", {})
+        validate_record_schema(body, "api_run_submission", kind="run")
+        validate_submission_pieces(config, path, body)
+        op = build_submit_op(path, run_name, body)
+        # Guarded CLI ops get this preflight from the receipt machinery; the trusted
+        # in-process path must run it explicitly or data_source_refs silently become
+        # decoration (unknown ids / integrity mismatches must die BEFORE docker).
+        operation_data_source_ref_preflight(op["request"])
+        sha = request_sha256(op)
+
+        if body.get("dry_run"):
+            preview = {k: v for k, v in op["request"].items() if k != "project_root"}
+            if _lineage:  # plain resubmit would drop lineage — point back at submit-from
+                submit_cmd = (
+                    f"POST /v1/projects/{path.name}/runs/{run_name}"
+                    f"/submit-from/{_lineage['parent_run']}"
+                )
+            else:
+                submit_cmd = f"POST /v1/projects/{path.name}/runs/{run_name}/submit"
+            return envelope_response(
+                ok=True,
+                data={
+                    "run_name": run_name,
+                    "dry_run": True,
+                    "request_sha256": sha,
+                    "op_request": preview,
+                },
+                warnings=warnings or [],
+                next_actions=[
+                    next_action(
+                        "submit",
+                        "http_request",
+                        "resend without dry_run to launch",
+                        blocking=False,
+                        command=submit_cmd,
+                    )
+                ],
+            )
+
+        run_path = path / "runs" / f"{run_name}.yaml"
+        is_retry = False
+        with WRITE_LOCK:
+            require_active_project(config, project_id)
+            if run_path.exists():
+                existing = load_yaml_record(run_path, kind="run")
+                existing_sha = (existing.get("submission") or {}).get("request_sha256")
+                if existing_sha != sha:
+                    raise OperationError(
+                        "run.exists",
+                        "run exists with a different submission; runs are immutable — "
+                        "submit under a new run_name",
+                        {"run_name": run_name},
+                    )
+                existing_sub = existing.get("submission") or {}
+                if (
+                    _lineage is None
+                    and existing_sub.get("parent_run")
+                    and existing_sub.get("request_sha256") == sha
+                ):
+                    # identical-body retry of a submit-from/probe child (e.g. after a
+                    # crash window) must not erase its recorded lineage — nor the probe
+                    # metadata that marks the run as budget-limited and question-bound
+                    _lineage = {
+                        "parent_run": existing_sub.get("parent_run"),
+                        "overrides": existing_sub.get("overrides") or {},
+                    }
+                    if existing.get("probe"):
+                        _lineage["probe"] = existing["probe"]
+                if existing.get("status") not in SUBMISSION_RETRYABLE_DECLARED:
+                    return envelope_response(
+                        ok=True,
+                        data={
+                            "run_name": run_name,
+                            "already_exists": True,
+                            "declared_status": existing.get("status"),
+                        },
+                        next_actions=[status_next_action(path.name, run_name)],
+                    )
+                is_retry = True
+            atomic_write_yaml(
+                run_path,
+                preserve_analysis(
+                    run_path,
+                    submission_record(
+                        run_name, body, sha, status="submitting", lineage=_lineage
+                    )
+                ),
+            )
+            managed_created = False
+            if body.get("managed") is not None:
+                # BEFORE docker: if we crash mid-launch, the read plane and the
+                # reconciler can still see/adopt the container via the managed_run.
+                atomic_write_yaml(
+                    path / "managed_runs" / f"{run_name}.yaml",
+                    managed_run_record(run_name, body),
+                )
+                managed_created = True
+
+        adopted = False
+        try:
+            # stale control (M2): a leftover control.json from the run_dir's
+            # previous life (e.g. a graceful stop before a resume relaunch) would
+            # be applied by the fresh trainer at its first metrics boundary — a
+            # resumed run could silently stop itself. Clear it BEFORE docker;
+            # if it cannot be removed, fail closed INSIDE this try so the failure
+            # takes the same submit_failed cleanup (record + managed_run unlink +
+            # journal) as any other pre-container launch error — never a ghost.
+            # (Unlinked outside WRITE_LOCK: a concurrent control POST can recreate
+            # the file before the container starts; ordering a control write
+            # against an in-flight relaunch is inherently racy client-side.)
+            from kikai_lab.server.runs import resolved_run_dir
+
+            stale_managed = load_managed_run_optional(path, run_name)
+            stale_run_dir = resolved_run_dir(path, run_name, stale_managed, config)
+            if stale_run_dir is not None:
+                stale_control = Path(stale_run_dir) / "control.json"
+                if stale_control.exists():
+                    try:
+                        stale_control.unlink()
+                    except OSError as exc:
+                        raise OperationError(
+                            "run.control_stale_unremovable",
+                            "a stale control.json exists in the run_dir and could "
+                            "not be removed (root-owned run dirs need the chown "
+                            "repair); launching would let it drive the fresh "
+                            "trainer",
+                            {"run_name": run_name, "error": type(exc).__name__},
+                        ) from exc
+            result = execute_operation(op)
+        except OperationError as exc:
+            if exc.code == "operation.script_bundle_run_name_in_use" and is_retry:
+                # An identical submission already started this container (crash after
+                # docker run, before the final record write) — adopt it instead of
+                # wedging on permanent retry. Adoption keys on (same sha + retryable
+                # status + name collision); two runs sharing one container profile
+                # alias the same docker name, which is a pre-existing constraint of
+                # profile-named containers.
+                adopted = True
+                result = {"execution_status": "adopted_existing_container"}
+            else:
+                with WRITE_LOCK:
+                    atomic_write_yaml(
+                        run_path,
+                        preserve_analysis(
+                            run_path,
+                            {
+                                **submission_record(
+                                    run_name,
+                                    body,
+                                    sha,
+                                    status="submit_failed",
+                                    lineage=_lineage,
+                                ),
+                                "submit_error": exc.code,
+                            },
+                        ),
+                    )
+                    # No container started: the pre-written managed_run would make the
+                    # reconciler tick a ghost forever and the read plane would report
+                    # 'submitted' over the declared failure.
+                    (path / "managed_runs" / f"{run_name}.yaml").unlink(missing_ok=True)
+                append_journal(
+                    path,
+                    "run_submit_failed",
+                    {
+                        "run_name": run_name,
+                        "error": exc.code,
+                        "parent_run": (_lineage or {}).get("parent_run"),
+                    },
+                )
+                if exc.code == "operation.script_bundle_run_name_in_use":
+                    raise OperationError(
+                        exc.code,
+                        exc.message + " (stop the run holding this container first)",
+                        {
+                            **exc.details,
+                            "next": f"POST /v1/projects/{path.name}/runs/{run_name}/stop",
+                        },
+                    ) from exc
+                raise
+
+        with WRITE_LOCK:
+            record = submission_record(
+                run_name, body, sha, status="running", lineage=_lineage
+            )
+            # the DOCKER id from `docker run -d` stdout — result["container_id"] is
+            # the container PROFILE id, already stored as submission.container_id
+            record["submission"]["started_container_id"] = result.get(
+                "started_container_id"
+            )
+            atomic_write_yaml(run_path, preserve_analysis(run_path, record))
+            atomic_write_json(
+                path / "ops" / f"{run_name}_submit.json",
+                {**op, "result_summary": {"execution_status": result.get("execution_status")}},
+            )
+        append_journal(
+            path,
+            "run_submitted",
+            {
+                "run_name": run_name,
+                "adopted": adopted,
+                "parent_run": (_lineage or {}).get("parent_run"),
+            },
+        )
+        return envelope_response(
+            ok=True,
+            data={
+                "run_name": run_name,
+                "submitted": True,
+                "adopted_existing_container": adopted,
+                "request_sha256": sha,
+                "managed_run_created": managed_created,
+                "derived_status": "running",
+            },
+            warnings=warnings or [],
+            next_actions=[
+                status_next_action(path.name, run_name),
+                next_action(
+                    "watch_metrics",
+                    "http_request",
+                    "poll loss once training is stepping",
+                    blocking=False,
+                    command=(
+                        f"GET /v1/projects/{path.name}/runs/{run_name}/metrics"
+                        "?keys=loss&max_points=200"
+                    ),
+                ),
+            ],
+            status_code=201,
+        )
+
+    @router.post("/projects/{project_id}/runs/{run_name}/submit-from/{parent_run}")
+    def run_submit_from(
+        project_id: str,
+        run_name: str,
+        parent_run: str,
+        body: Annotated[dict[str, Any] | None, Body()] = None,
+    ) -> JSONResponse:
+        """Differential submission: inherit the parent run's full configuration,
+        rebind every occurrence of the parent's name to the new run (run_dir, QC
+        paths/labels...), apply the caller's overrides, and record lineage — one
+        small call instead of resending a 60-line body, with the one-variable
+        discipline enforced by construction."""
+        path = require_active_project(config, project_id)
+        run_name = require_safe_id(run_name, kind="run")
+        parent_run = require_safe_id(parent_run, kind="run")
+        body = body if isinstance(body, dict) else {}
+        overrides = body.get("overrides") or {}
+        if not isinstance(overrides, dict):
+            raise OperationError(
+                "run.record_invalid", "overrides must be a JSON object", {}
+            )
+        parent_body, reconstruct_warnings = reconstruct_submit_body(path, parent_run)
+        siblings = frozenset(
+            f.stem for f in (path / "runs").glob("*.yaml") if f.stem != parent_run
+        )
+        # rebind ONLY run-derived fields; identity keys (bundle_id, container_id,
+        # experiment_id, data_source_refs) name registered resources, never the run
+        rebound = dict(parent_body)
+        for field in ("args", "env", "run_dir", "managed"):
+            if field in rebound:
+                rebound[field] = rebind_run_name(
+                    rebound[field], parent_run, run_name, sibling_runs=siblings
+                )
+        merged = apply_overrides(rebound, overrides)
+        merged["dry_run"] = bool(body.get("dry_run"))
+        return do_submit(
+            project_id,
+            run_name,
+            merged,
+            {"parent_run": parent_run, "overrides": overrides},
+            warnings=reconstruct_warnings,
+        )
+
+    @router.post("/projects/{project_id}/runs/{run_name}/probe-from/{parent_run}")
+    def run_probe_from(
+        project_id: str,
+        run_name: str,
+        parent_run: str,
+        body: Annotated[dict[str, Any], Body()] = ...,
+    ) -> JSONResponse:
+        """PROBE: a short, checkpoint-warm-started run that answers ONE question
+        before anyone pays for a fresh full run. Inherits the parent's config
+        (submit-from machinery), auto-injects --resume-checkpoint pointing at the
+        parent's best/latest checkpoint (container path) and --max-steps =
+        resume_step + probe_steps, defaults retention to 1+1, and records
+        probe metadata (question, budget) on the run. Declare metric_checks with
+        window_steps_relative: true so gates judge offsets from the resume point."""
+        path = require_active_project(config, project_id)
+        run_name = require_safe_id(run_name, kind="run")
+        parent_run = require_safe_id(parent_run, kind="run")
+        if not isinstance(body, dict):
+            raise OperationError("run.record_invalid", "body must be a JSON object", {})
+        question = str(body.get("question") or "").strip()
+        if not question:
+            raise OperationError(
+                "run.probe_invalid",
+                "a probe MUST state its question (that is the point of a probe)",
+                {"run_name": run_name},
+            )
+        probe_steps = body.get("probe_steps")
+        if not isinstance(probe_steps, int) or isinstance(probe_steps, bool) or not (
+            0 < probe_steps <= 20000
+        ):
+            raise OperationError(
+                "run.probe_invalid",
+                "probe_steps must be an integer in 1..20000 — longer is not a probe",
+                {"probe_steps": probe_steps},
+            )
+        overrides = body.get("overrides") or {}
+        if not isinstance(overrides, dict):
+            raise OperationError(
+                "run.record_invalid", "overrides must be a JSON object", {}
+            )
+        if overrides.get("managed") is not None and not isinstance(
+            overrides["managed"], dict
+        ):
+            raise OperationError(
+                "run.record_invalid", "overrides.managed must be a JSON object", {}
+            )
+        resume_arg = str(body.get("resume_arg") or "--resume-checkpoint")
+        max_steps_arg = str(body.get("max_steps_arg") or "--max-steps")
+        run_dir_arg = str(body.get("run_dir_arg") or "--run-dir")
+
+        ckpt_name, resume_step = resolve_parent_checkpoint(
+            config, path, parent_run, body.get("checkpoint", "best")
+        )
+        parent_body, reconstruct_warnings = reconstruct_submit_body(path, parent_run)
+        # the parent's CONTAINER run dir (pre-rebind!) anchors the checkpoint path
+        parent_container_run_dir = arg_value_after(
+            parent_body.get("args") or [], run_dir_arg
+        )
+        if not parent_container_run_dir:
+            raise OperationError(
+                "run.probe_invalid",
+                f"parent args carry no '{run_dir_arg}' value to anchor the container "
+                "checkpoint path — pass run_dir_arg naming your trainer's flag",
+                {"parent_run": parent_run},
+            )
+        container_ckpt = f"{parent_container_run_dir}/checkpoints/{ckpt_name}"
+
+        siblings = frozenset(
+            f.stem for f in (path / "runs").glob("*.yaml") if f.stem != parent_run
+        )
+        rebound = dict(parent_body)
+        for field in ("args", "env", "run_dir", "managed"):
+            if field in rebound:
+                rebound[field] = rebind_run_name(
+                    rebound[field], parent_run, run_name, sibling_runs=siblings
+                )
+        merged = apply_overrides(rebound, overrides)
+        # probe-authoritative knobs LAST — the endpoint owns resume/budget/lifecycle
+        merged = apply_overrides(
+            merged,
+            {
+                "args_set": {
+                    resume_arg: container_ckpt,
+                    max_steps_arg: str(resume_step + probe_steps),
+                }
+            },
+        )
+        managed = dict(merged.get("managed") or {})
+        managed["max_step"] = resume_step + probe_steps
+        if "retention" not in (overrides.get("managed") or {}):
+            managed["retention"] = {"keep_latest": 1, "keep_best": 1}
+        merged["managed"] = managed
+        merged["resume"] = {"fresh_no_resume": False}
+        merged["dry_run"] = bool(body.get("dry_run"))
+        return do_submit(
+            project_id,
+            run_name,
+            merged,
+            {
+                "parent_run": parent_run,
+                "overrides": overrides,
+                "probe": {
+                    "parent_run": parent_run,
+                    "question": question,
+                    "budget_steps": probe_steps,
+                    "resume_step": resume_step,
+                    "resume_checkpoint": container_ckpt,
+                },
+            },
+            warnings=reconstruct_warnings,
+        )
+
+    @router.post("/projects/{project_id}/runs/{run_name}/control")
+    def run_control_write(
+        project_id: str,
+        run_name: str,
+        body: Annotated[dict[str, Any], Body()] = ...,
+    ) -> JSONResponse:
+        """Live control plane: change a RUNNING training's termination policy
+        without a restart. Writes <run_dir>/control.json atomically; a
+        control-plane-aware trainer applies it on its next metrics boundary and
+        logs a control_applied event. Keys: max_steps / early_stop_patience
+        (int > 0), early_stop_min_delta (number >= 0), stop: "graceful"
+        (checkpoint + clean exit). max_steps also syncs managed_run.max_step so
+        the daemon lifecycle follows the new cap."""
+        from kikai_lab.server.runs import resolved_run_dir
+
+        path = require_active_project(config, project_id)
+        run_name = require_safe_id(run_name, kind="run")
+        require_run_record(path, run_name)
+        if not isinstance(body, dict) or not body:
+            raise OperationError(
+                "run.control_invalid",
+                "control body must be a non-empty JSON object",
+                {"run_name": run_name},
+            )
+        control: dict[str, Any] = {}
+        for key in ("max_steps", "early_stop_patience"):
+            if key in body:
+                value = body[key]
+                if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                    raise OperationError(
+                        "run.control_invalid",
+                        f"{key} must be a positive integer",
+                        {key: value},
+                    )
+                control[key] = value
+        if "early_stop_min_delta" in body:
+            value = body["early_stop_min_delta"]
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                raise OperationError(
+                    "run.control_invalid",
+                    "early_stop_min_delta must be a non-negative number",
+                    {"early_stop_min_delta": value},
+                )
+            control["early_stop_min_delta"] = float(value)
+        if "stop" in body:
+            if body["stop"] != "graceful":
+                raise OperationError(
+                    "run.control_invalid",
+                    "stop supports only 'graceful' (checkpoint + clean exit); "
+                    "for a hard kill use POST .../stop",
+                    {"stop": body["stop"]},
+                )
+            control["stop"] = "graceful"
+        unknown = sorted(set(body) - set(control))
+        if unknown:
+            raise OperationError(
+                "run.control_invalid",
+                "unknown control keys (whitelist: max_steps, early_stop_patience, "
+                "early_stop_min_delta, stop)",
+                {"unknown": unknown},
+            )
+
+        with WRITE_LOCK:
+            managed = load_managed_run_optional(path, run_name)
+            run_dir = resolved_run_dir(path, run_name, managed, config)
+            if run_dir is None:
+                raise OperationError(
+                    "run.run_dir_missing",
+                    "run declares no resolvable run_dir to carry a control file",
+                    {"run_name": run_name},
+                )
+            control_path = Path(run_dir) / "control.json"
+            tmp = control_path.with_suffix(".json.tmp")
+            try:
+                tmp.write_text(
+                    json.dumps(control, ensure_ascii=False, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                tmp.replace(control_path)
+            except FileNotFoundError as exc:
+                raise OperationError(
+                    "run.run_dir_missing",
+                    "the run_dir does not exist yet — nothing is training there "
+                    "to control",
+                    {"run_name": run_name},
+                ) from exc
+            except OSError as exc:
+                raise OperationError(
+                    "run.control_write_failed",
+                    "could not write control.json into the run_dir "
+                    "(root-owned run dirs need the chown repair first)",
+                    {"run_name": run_name, "error": type(exc).__name__},
+                ) from exc
+            if "max_steps" in control and managed is not None:
+                managed_path = path / "managed_runs" / f"{run_name}.yaml"
+                managed_record = load_yaml_record(managed_path, kind="managed_run")
+                managed_record["max_step"] = control["max_steps"]
+                atomic_write_yaml(managed_path, managed_record)
+        control_warnings: list[dict[str, Any]] = []
+        if "max_steps" in control:
+            from kikai_lab.operation import resolve_metrics_path
+            from kikai_lab.server.metrics import read_last_train_metrics
+
+            metrics_path = resolve_metrics_path(Path(run_dir))
+            latest = read_last_train_metrics(metrics_path) if metrics_path.exists() else None
+            latest_step = latest.get("step") if latest else None
+            if isinstance(latest_step, int) and control["max_steps"] <= latest_step:
+                # the trainer will fall out of its loop labeled 'done' — an
+                # operator truncation masquerading as natural completion
+                control_warnings.append(
+                    error(
+                        "run.control_truncates",
+                        "max_steps is at or below the last known step; the run "
+                        "will end as 'completed' — use stop:'graceful' if an "
+                        "intentional stop should read as one",
+                        blocking=False,
+                        details={
+                            "max_steps": control["max_steps"],
+                            "latest_step": latest_step,
+                        },
+                    )
+                )
+        append_journal(path, "run_control", {"run_name": run_name, **control})
+        return envelope_response(
+            ok=True,
+            warnings=control_warnings,
+            data={
+                "run_name": run_name,
+                "control": control,
+                "managed_max_step_synced": "max_steps" in control
+                and managed is not None,
+                "note": "a control-plane-aware trainer applies this on its next "
+                "metrics boundary; confirm via GET .../control (applied)",
+            },
+            next_actions=[
+                next_action(
+                    "confirm_applied",
+                    "http_request",
+                    "check the trainer acknowledged the change",
+                    blocking=False,
+                    command=f"GET /v1/projects/{path.name}/runs/{run_name}/control",
+                )
+            ],
+            status_code=201,
+        )
+
+    @router.get("/projects/{project_id}/runs/{run_name}/control")
+    def run_control_read(project_id: str, run_name: str) -> JSONResponse:
+        """Requested control (control.json) vs what the trainer ACTUALLY applied
+        (last control_applied event in metrics.jsonl). applied=null with a
+        non-null requested means the trainer has not reached a metrics boundary
+        yet — or predates the control plane entirely."""
+        from kikai_lab.operation import resolve_metrics_path
+        from kikai_lab.server.runs import resolved_run_dir
+
+        path = require_project(config, project_id)
+        run_name = require_safe_id(run_name, kind="run")
+        require_run_record(path, run_name)
+        managed = load_managed_run_optional(path, run_name)
+        run_dir = resolved_run_dir(path, run_name, managed, config)
+        requested = None
+        applied = None
+        if run_dir is not None:
+            control_path = Path(run_dir) / "control.json"
+            if control_path.is_file():
+                try:
+                    requested = json.loads(control_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    requested = {"_unreadable": True}
+            metrics_path = resolve_metrics_path(Path(run_dir))
+            if metrics_path.exists():
+                try:
+                    with metrics_path.open("r", encoding="utf-8") as f:
+                        for line in f:
+                            stripped = line.strip()
+                            if not stripped or '"control_applied"' not in stripped:
+                                continue
+                            try:
+                                row = json.loads(stripped)
+                            except ValueError:
+                                continue
+                            if row.get("event") == "control_applied":
+                                applied = {
+                                    "step": row.get("step"),
+                                    "applied": row.get("applied"),
+                                    "ignored": row.get("ignored"),
+                                }
+                except OSError:
+                    pass
+        return envelope_response(
+            ok=True,
+            data={"run_name": run_name, "requested": requested, "applied": applied},
+        )
+
+    @router.post("/projects/{project_id}/runs/{run_name}/conclusion")
+    def run_conclusion(
+        project_id: str,
+        run_name: str,
+        body: Annotated[dict[str, Any], Body()] = ...,
+    ) -> JSONResponse:
+        """Append a result analysis (考察) to the run record — verdict + summary +
+        evidence. Append-only: later conclusions supersede but never erase earlier
+        ones, so the reasoning trail stays with the run (dashboard + API), not in
+        chat history."""
+        path = require_active_project(config, project_id)
+        run_name = require_safe_id(run_name, kind="run")
+        if not isinstance(body, dict):
+            raise OperationError("run.record_invalid", "body must be a JSON object", {})
+        verdict = body.get("verdict")
+        if verdict not in ("adopted", "rejected", "superseded", "inconclusive"):
+            raise OperationError(
+                "run.record_invalid",
+                "verdict must be adopted|rejected|superseded|inconclusive",
+                {"verdict": verdict},
+            )
+        summary = body.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise OperationError(
+                "run.record_invalid", "summary (the analysis text) is required", {}
+            )
+        entry: dict[str, Any] = {
+            "at": utc_now_text(),
+            "verdict": verdict,
+            "summary": summary.strip(),
+        }
+        if isinstance(body.get("evidence"), list):
+            entry["evidence"] = [str(e) for e in body["evidence"]][:20]
+        if isinstance(body.get("next_run"), str) and body["next_run"]:
+            entry["next_run"] = body["next_run"]
+        run_path = path / "runs" / f"{run_name}.yaml"
+        with WRITE_LOCK:
+            require_active_project(config, project_id)
+            if not run_path.is_file():
+                raise OperationError(
+                    "run.not_found",
+                    f"no run '{run_name}' in project '{path.name}'",
+                    {"run_name": run_name},
+                )
+            record = load_yaml_record(run_path, kind="run")
+            record.setdefault("conclusions", []).append(entry)
+            record["verdict"] = verdict  # latest verdict wins for list badges
+            atomic_write_yaml(run_path, record)
+        append_journal(
+            path,
+            "conclusion",
+            {"run_name": run_name, "verdict": verdict, "summary": summary.strip()[:200]},
+        )
+        return envelope_response(
+            ok=True,
+            data={
+                "run_name": run_name,
+                "recorded": True,
+                "verdict": verdict,
+                "conclusion_count": len(record["conclusions"]),
+            },
+            status_code=201,
+        )
+
+    @router.post("/projects/{project_id}/runs/{run_name}/stop")
+    def run_stop(project_id: str, run_name: str) -> JSONResponse:
+        path = require_project(config, project_id)
+        run_name = require_safe_id(run_name, kind="run")
+        managed = load_managed_run_optional(path, run_name)
+        container_id = None
+        if managed:
+            container_id = managed.get("training_container_id")
+        else:
+            run_path = path / "runs" / f"{run_name}.yaml"
+            if run_path.is_file():
+                record = load_yaml_record(run_path, kind="run")
+                container_id = (record.get("submission") or {}).get("container_id")
+        if not container_id:
+            raise OperationError(
+                "run.not_found",
+                "run has no managed_run or submission record to stop",
+                {"run_name": run_name},
+            )
+        container = load_container_record(path, container_id)
+        name = resolve_text_ref(docker_name_from_container(container, container_id))
+        request = {"project_root": str(path)}
+        found, _, _ = docker_inspect_by_name(request, name)
+        if not found:
+            return envelope_response(
+                ok=True,
+                data={"run_name": run_name, "already_stopped": True},
+            )
+        docker_rm_force(request, name)
+        append_journal(path, "run_stopped", {"run_name": run_name})
+        return envelope_response(
+            ok=True,
+            data={
+                "run_name": run_name,
+                "stopped": True,
+                "note": "the reconciler finalizes (retention + notification) on its next tick",
+            },
+        )
+
+    @router.post("/projects/{project_id}/operations")
+    def operations_escape_hatch(
+        project_id: str,
+        dry_run: bool = Query(False),
+        body: Annotated[dict[str, Any], Body()] = ...,
+    ) -> JSONResponse:
+        """Execute an arbitrary operation request in-process (trusted caller).
+
+        Keeps every existing adapter reachable without new endpoint work. The server
+        pins ``project_root`` to this project — a body cannot point elsewhere.
+        """
+        path = require_active_project(config, project_id)
+        request = body.get("request") if isinstance(body.get("request"), dict) else body
+        if not isinstance(request, dict) or not request.get("adapter"):
+            raise OperationError(
+                "operation.request_invalid",
+                "body must be an operation request object with an adapter",
+                {},
+            )
+        request = {**request, "project_root": str(path)}
+        operation_name = str(request.get("operation") or "operation")
+        op = {"kind": "kikai_operation", "schema_version": 1, "request": request}
+        sha = request_sha256(op)
+        if dry_run:
+            preview = {k: v for k, v in request.items() if k != "project_root"}
+            return envelope_response(
+                ok=True,
+                data={"dry_run": True, "request_sha256": sha, "op_request": preview},
+            )
+        result = execute_operation(op)
+        with WRITE_LOCK:
+            atomic_write_json(
+                path / "ops" / f"{operation_name}_{sha[:8]}.json",
+                {**op, "result_summary": {"execution_status": result.get("execution_status")}},
+            )
+        return envelope_response(
+            ok=True, data={"request_sha256": sha, "result": result}
+        )
+
+    return router
+
+
+def status_next_action(project_id: str, run_name: str) -> dict[str, Any]:
+    return next_action(
+        "poll_status",
+        "http_request",
+        "poll the derived run status",
+        blocking=False,
+        command=f"GET /v1/projects/{project_id}/runs/{run_name}/status",
+    )

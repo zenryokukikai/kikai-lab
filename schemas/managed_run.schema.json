@@ -1,0 +1,199 @@
+{
+  "$id": "https://kikai-lab.local/schemas/managed_run.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Desired-state artifact for a training run actively managed by the reconciler daemon (kikai serve). One file per active run under managed_runs/<run_id>.yaml. The daemon owns a sibling managed_runs/<run_id>.progress.json for idempotent ticks.",
+  "properties": {
+    "delivery_target_id": {
+      "description": "delivery_targets/<id> used for daemon-sent lifecycle notifications (start/done/fail).",
+      "type": "string"
+    },
+    "evaluations": {
+      "items": {
+        "properties": {
+          "artifacts_dir": {
+            "type": "string"
+          },
+          "eval_id": {
+            "type": "string"
+          },
+          "op": {
+            "type": "object"
+          },
+          "trigger": {
+            "additionalProperties": false,
+            "properties": {
+              "at_steps": {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              "every_n_steps": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "on_finalize": {
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "eval_id",
+          "trigger",
+          "op"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "experiment_id": {
+      "description": "Experiment whose checkpoint_retention block supplies keep_latest/keep_best when 'retention' is omitted.",
+      "type": "string"
+    },
+    "kind": {
+      "const": "managed_run"
+    },
+    "lifecycle": {
+      "description": "Lifecycle policy; currently 'until_early_stop' (finalize + teardown on terminal metrics event or container exit).",
+      "type": "string"
+    },
+    "max_step": {
+      "description": "QC is generated only for checkpoints up to this step; null = no cap.",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "metric_checks": {
+      "items": {
+        "properties": {
+          "check_id": {
+            "type": "string"
+          },
+          "expect": {
+            "enum": [
+              "decreasing",
+              "below",
+              "above"
+            ]
+          },
+          "key": {
+            "type": "string"
+          },
+          "min_delta": {
+            "type": "number"
+          },
+          "threshold": {
+            "type": "number"
+          },
+          "window_steps": {
+            "type": "array"
+          },
+          "window_steps_relative": {
+            "description": "window_steps are offsets from the run's FIRST metrics step (probe/resume segments) instead of absolute steps",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "check_id",
+          "key",
+          "expect"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "poll_interval_sec": {
+      "type": "integer"
+    },
+    "qc_artifacts_dir": {
+      "description": "Daemon-local directory template ({{step}}/{{step6}}, refs allowed) globbed for QC media to record in the artifact ledger after each successful QC.",
+      "type": "string"
+    },
+    "qc_op": {
+      "description": "Inline alternative to qc_op_template: a kikai_operation object with the same placeholders.",
+      "type": "object"
+    },
+    "qc_op_template": {
+      "description": "Path (relative to project_root) to a kikai_operation template run per new checkpoint. Placeholders {{step}}, {{step6}}, {{checkpoint_name}}, {{run_id}} are substituted before execution. If the template is an operation_sequence, its pipeline_run_id MUST embed {{step}}/{{step6}} (each checkpoint writes a one-shot pipeline_runs record that is never overwritten); the daemon rejects a non-step-varying one.",
+      "type": "string"
+    },
+    "retention": {
+      "additionalProperties": true,
+      "description": "Two independent rolling windows. Omit to inherit the experiment's checkpoint_retention block.",
+      "properties": {
+        "keep_best": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "keep_latest": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "keep_milestones": {
+          "description": "trajectory anchors for offline probes: protect periodic checkpoints matching (step-from_step) % every_steps == 0 within [from_step, until_step]",
+          "items": {
+            "properties": {
+              "every_steps": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "from_step": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "until_step": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "every_steps"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "metric_key": {
+          "type": "string"
+        },
+        "metric_mode": {
+          "enum": [
+            "min",
+            "max"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "run_dir": {
+      "description": "Daemon-local run directory containing checkpoints/ (env: or ${VAR} refs allowed).",
+      "minLength": 1,
+      "type": "string"
+    },
+    "run_id": {
+      "description": "Unique id for this managed run; keys the progress file.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer"
+    },
+    "training_container_id": {
+      "description": "Container id (containers/<id>.yaml) whose docker.name is polled for training status.",
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "run_dir",
+    "training_container_id"
+  ],
+  "type": "object"
+}

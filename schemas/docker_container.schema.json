@@ -1,0 +1,84 @@
+{
+  "$id": "https://kikai-lab.local/schemas/docker_container.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "container_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "docker": {
+      "additionalProperties": true,
+      "properties": {
+        "gpus": {
+          "type": "string"
+        },
+        "image": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+          "type": "string"
+        },
+        "network_mode": {
+          "type": "string"
+        },
+        "restart_policy": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "image"
+      ],
+      "type": "object"
+    },
+    "healthcheck": {
+      "type": "object"
+    },
+    "host_id": {
+      "type": "string"
+    },
+    "kind": {
+      "const": "docker_container"
+    },
+    "mounts": {
+      "items": {
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "related_runs": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "role": {
+      "type": "string"
+    },
+    "schema_version": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "status": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "workdir": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "kind",
+    "container_id",
+    "docker"
+  ],
+  "title": "Kikai Lab Docker Container",
+  "type": "object"
+}

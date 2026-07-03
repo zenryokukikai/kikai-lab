@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "kind": "kikai_operation",
+  "request": {
+    "operation": "render_qc",
+    "project_root": "${PROJECT_ROOT}",
+    "target_id": "example_run_qc",
+    "adapter": "noop",
+    "argv": [
+      "true"
+    ],
+    "side_effects": [
+      "validated_noop"
+    ]
+  }
+}

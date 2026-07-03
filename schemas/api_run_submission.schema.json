@@ -1,0 +1,128 @@
+{
+  "$id": "https://kikai-lab.local/schemas/api_run_submission.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Kikai Server Run Submission",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "container_id",
+    "bundle_id",
+    "entrypoint"
+  ],
+  "properties": {
+    "experiment_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "container_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "bundle_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "entrypoint": {
+      "type": "string",
+      "minLength": 1
+    },
+    "args": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "data_source_refs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "role",
+          "data_source_id"
+        ],
+        "properties": {
+          "role": {
+            "type": "string"
+          },
+          "data_source_id": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "resume": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "checkpoint_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fresh_no_resume": {
+          "type": "boolean"
+        }
+      }
+    },
+    "run_dir": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Daemon-local run directory (refs like ${NAME} allowed); required for managed submissions."
+    },
+    "host_ref": {
+      "type": "string"
+    },
+    "managed": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_step": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "poll_interval_sec": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "lifecycle": {
+          "type": "string"
+        },
+        "delivery_target_id": {
+          "type": "string"
+        },
+        "retention": {
+          "type": "object"
+        },
+        "qc_op_template": {
+          "type": "string"
+        },
+        "qc_op": {
+          "type": "object"
+        },
+        "qc_artifacts_dir": {
+          "type": "string"
+        },
+        "evaluations": {
+          "type": "array"
+        },
+        "metric_checks": {
+          "type": "array"
+        }
+      }
+    },
+    "dry_run": {
+      "type": "boolean"
+    }
+  }
+}

@@ -1,0 +1,375 @@
+{
+  "$id": "https://kikai-lab.local/schemas/data_source.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "kind": {
+      "const": "kikai_data_source"
+    },
+    "data_source_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    },
+    "status": {
+      "enum": [
+        "active",
+        "deprecated",
+        "blocked"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "source_type": {
+      "enum": [
+        "dataset_manifest",
+        "dataset_directory",
+        "cache_directory",
+        "media_file",
+        "media_directory",
+        "checkpoint_file",
+        "model_artifact",
+        "metrics_log",
+        "external_dataset",
+        "opaque_input"
+      ]
+    },
+    "immutability": {
+      "additionalProperties": true,
+      "properties": {
+        "mode": {
+          "enum": [
+            "immutable",
+            "append_only",
+            "mutable_live"
+          ]
+        },
+        "verified_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "type": "object"
+    },
+    "storage": {
+      "additionalProperties": true,
+      "properties": {
+        "storage_kind": {
+          "enum": [
+            "host_path",
+            "container_path",
+            "object_uri",
+            "kikai_runtime_path",
+            "artifact_ref"
+          ]
+        },
+        "host_ref": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "container_mount_path": {
+          "type": "string"
+        },
+        "container_id": {
+          "type": "string"
+        },
+        "container_role": {
+          "type": "string"
+        },
+        "uri": {
+          "type": "string"
+        },
+        "artifact_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "storage_kind"
+      ],
+      "type": "object",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "storage_kind": {
+                "const": "host_path"
+              }
+            },
+            "required": [
+              "storage_kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "host_ref",
+              "path"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "storage_kind": {
+                "const": "container_path"
+              }
+            },
+            "required": [
+              "storage_kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "path"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "storage_kind": {
+                "const": "object_uri"
+              }
+            },
+            "required": [
+              "storage_kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "uri"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "storage_kind": {
+                "const": "kikai_runtime_path"
+              }
+            },
+            "required": [
+              "storage_kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "path"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "storage_kind": {
+                "const": "artifact_ref"
+              }
+            },
+            "required": [
+              "storage_kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "artifact_id"
+            ]
+          }
+        }
+      ]
+    },
+    "integrity": {
+      "additionalProperties": true,
+      "properties": {
+        "strategy": {
+          "enum": [
+            "file_sha256",
+            "directory_manifest_sha256",
+            "object_etag",
+            "artifact_digest",
+            "not_available"
+          ]
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "verification": {
+          "type": "string"
+        },
+        "calculated_by": {
+          "enum": [
+            "kikai_lab.data-source.create-file",
+            "kikai_lab.data-source.create-directory-manifest"
+          ]
+        },
+        "calculated_at": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "strategy"
+      ],
+      "type": "object",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "strategy": {
+                "const": "file_sha256"
+              }
+            },
+            "required": [
+              "strategy"
+            ]
+          },
+          "then": {
+            "required": [
+              "sha256",
+              "calculated_by",
+              "calculated_at"
+            ],
+            "properties": {
+              "calculated_by": {
+                "const": "kikai_lab.data-source.create-file"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "strategy": {
+                "const": "directory_manifest_sha256"
+              }
+            },
+            "required": [
+              "strategy"
+            ]
+          },
+          "then": {
+            "required": [
+              "sha256",
+              "calculated_by",
+              "calculated_at"
+            ],
+            "properties": {
+              "calculated_by": {
+                "const": "kikai_lab.data-source.create-directory-manifest"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "strategy": {
+                "const": "not_available"
+              }
+            },
+            "required": [
+              "strategy"
+            ]
+          },
+          "then": {
+            "required": [
+              "reason"
+            ]
+          }
+        }
+      ]
+    },
+    "contract": {
+      "additionalProperties": true,
+      "properties": {
+        "role_compatibility": {
+          "items": {
+            "$ref": "#/$defs/canonical_role"
+          },
+          "type": "array"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "sample_unit": {
+          "type": "string"
+        },
+        "required_fields": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "provenance": {
+      "additionalProperties": true,
+      "properties": {
+        "created_by": {
+          "type": "string"
+        },
+        "upstream_data_source_ids": {
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+          },
+          "type": "array"
+        },
+        "upstream_source_snapshot_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "notes": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "kind",
+    "data_source_id",
+    "source_type",
+    "status",
+    "storage",
+    "immutability"
+  ],
+  "$defs": {
+    "canonical_role": {
+      "enum": [
+        "train_manifest",
+        "eval_manifest",
+        "face_cache",
+        "source_audio",
+        "source_video",
+        "tts_corpus",
+        "initial_checkpoint",
+        "resume_checkpoint",
+        "teacher_checkpoint",
+        "reference_media",
+        "preview_audio",
+        "metrics_log",
+        "status_input"
+      ],
+      "type": "string"
+    }
+  },
+  "title": "Kikai Lab Data Source",
+  "type": "object"
+}

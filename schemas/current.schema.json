@@ -1,0 +1,78 @@
+{
+  "$id": "https://kikai-lab.local/schemas/current.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "current_checkpoint": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "current_experiment_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "current_model_arch": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "current_run_name": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "established_by_decision_id": {
+      "type": "string"
+    },
+    "external_refs": {
+      "items": {
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "last_verified_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "must_read_external_ref_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "next_decision_id": {
+      "type": "string"
+    },
+    "next_decision_required": {
+      "type": "boolean"
+    },
+    "project_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "staleness_block_after_hours": {
+      "minimum": 0,
+      "type": "number"
+    },
+    "staleness_warn_after_hours": {
+      "minimum": 0,
+      "type": "number"
+    },
+    "status": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "verified_by": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version"
+  ],
+  "title": "Kikai Lab Current",
+  "type": "object"
+}

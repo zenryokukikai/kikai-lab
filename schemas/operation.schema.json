@@ -1,0 +1,287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kikai-lab.local/schemas/operation.schema.json",
+  "title": "Kikai Lab Operation",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "kind",
+    "request"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "kind": {
+      "const": "kikai_operation"
+    },
+    "request": {
+      "type": "object",
+      "required": [
+        "operation",
+        "project_root"
+      ],
+      "properties": {
+        "operation": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project_root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target_id": {
+          "type": "string"
+        },
+        "adapter": {
+          "enum": [
+            "noop",
+            "docker_exec",
+            "script_bundle_exec",
+            "script_bundle_run",
+            "artifact_delivery",
+            "webhook_notification",
+            "operation_sequence",
+            "checkpoint_guard",
+            "trt_cache_guard",
+            "artifact_summary_guard"
+          ]
+        },
+        "container_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workdir": {
+          "type": "string"
+        },
+        "docker_host": {
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "argv": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "bundle_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "entrypoint": {
+          "type": "string",
+          "minLength": 1
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "pipeline_run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "guard_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "run_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "checkpoint": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model_arch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifact_class": {
+          "type": "string",
+          "minLength": 1
+        },
+        "trt_cache_dir": {
+          "type": "string",
+          "minLength": 1
+        },
+        "compile_mode": {
+          "type": "string",
+          "minLength": 1
+        },
+        "require_compile_cache": {
+          "type": "boolean"
+        },
+        "summary_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "require_optimize": {
+          "type": "string",
+          "minLength": 1
+        },
+        "require_trt_cache_dir": {
+          "type": "boolean"
+        },
+        "require_trt_cache_files": {
+          "type": "boolean"
+        },
+        "path_mappings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "from",
+              "to"
+            ],
+            "properties": {
+              "from": {
+                "type": "string",
+                "minLength": 1
+              },
+              "to": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "data_source_refs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "role"
+            ],
+            "properties": {
+              "role": {
+                "enum": [
+                  "train_manifest",
+                  "eval_manifest",
+                  "face_cache",
+                  "source_audio",
+                  "source_video",
+                  "tts_corpus",
+                  "initial_checkpoint",
+                  "resume_checkpoint",
+                  "teacher_checkpoint",
+                  "reference_media",
+                  "preview_audio",
+                  "metrics_log",
+                  "status_input"
+                ],
+                "type": "string"
+              },
+              "data_source_id": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "required": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": true,
+            "allOf": [
+              {
+                "if": {
+                  "anyOf": [
+                    {
+                      "not": {
+                        "required": [
+                          "data_source_id"
+                        ]
+                      }
+                    },
+                    {
+                      "properties": {
+                        "data_source_id": {
+                          "type": "null"
+                        }
+                      },
+                      "required": [
+                        "data_source_id"
+                      ]
+                    }
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "required": {
+                      "const": false
+                    }
+                  },
+                  "required": [
+                    "required"
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "guard_receipt": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "kind": {
+          "const": "kikai_guard_receipt"
+        },
+        "status": {
+          "const": "passed"
+        },
+        "issued_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "request_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "data_source_preflight": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      },
+      "required": [
+        "schema_version",
+        "kind",
+        "status",
+        "issued_at",
+        "request_sha256"
+      ]
+    }
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "$id": "https://kikai-lab.local/schemas/pipeline_run.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "external_refs": {
+      "items": {
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "operation": {
+      "type": "string"
+    },
+    "pipeline_run_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "project_id": {
+      "type": "string"
+    },
+    "recorded_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "schema_version": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "status": {
+      "enum": [
+        "completed",
+        "failed"
+      ]
+    },
+    "steps": {
+      "items": {
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "summary": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "pipeline_run_id",
+    "status",
+    "steps"
+  ],
+  "title": "Kikai Lab Pipeline Run",
+  "type": "object"
+}

@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kikai-lab.local/schemas/source_snapshot.schema.json",
+  "title": "Kikai Lab Source Snapshot",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "kind",
+    "source_snapshot_id",
+    "immutable",
+    "generated_by",
+    "files"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "kind": {
+      "const": "kikai_source_snapshot"
+    },
+    "source_snapshot_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "immutable": {
+      "const": true
+    },
+    "generated_by": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool",
+        "schema_version"
+      ],
+      "properties": {
+        "tool": {
+          "const": "kikai source-snapshot create"
+        },
+        "schema_version": {
+          "const": 1
+        }
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "path",
+          "sha256"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    }
+  }
+}
