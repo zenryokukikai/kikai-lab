@@ -2,9 +2,18 @@
 
 **An ML experiment registry and control server built for AI agents as first-class
 operators.** Most experiment trackers are dashboards a human reads. kikai is an
-HTTP control plane an agent *drives* — it launches training, watches it, judges
-it, and iterates, over a plain-file registry you can read with `cat` and diff in
-git.
+HTTP control plane an agent *drives* — launch training, watch it, judge it, and
+iterate — over a plain-file registry you can `cat`, diff, and grep.
+
+**Why you'd want it:**
+
+- 🔁 **Iterate in one call, not sixty lines** — `submit-from` inherits a run's whole config; change one variable, keep the lineage.
+- 🔬 **Test cheap before you commit** — `probe-from` warm-starts from a checkpoint to answer one question in a few thousand steps, not a full run.
+- 🎛️ **Steer a running run without restarting** — raise the step cap or stop it gracefully live, with zero lost warmup.
+- ✅ **The run judges itself** — declarative metric gates, QC renders, retention, and alerts all run from the run's own spec; conclusions live *with the run*.
+- ↩️ **Resume any session in one request** — `brief` / `journal` hand a fresh agent the full decision context, so there's no hand-off doc to keep in sync.
+- 🤖 **Made for models, not scraping** — every response is one typed envelope with stable error codes and a suggested next call; agents never touch Docker or SSH.
+- 📄 **No black box** — the entire registry is YAML/JSONL in git, and the server serves its own always-current agent guide at `GET /v1/skill.md`.
 
 ```
 agent ──HTTP──> kikai server ──> Docker training containers
@@ -15,36 +24,12 @@ agent ──HTTP──> kikai server ──> Docker training containers
                     └──── reconciler ────┘  (QC · gates · retention · finalize)
 ```
 
-The agent never touches Docker or SSH. It registers pieces by id and delegates
-management to kikai; the server ships its own agent guide at `GET /v1/skill.md`,
-so the instructions can never drift from the running version.
+The framework is trainer-agnostic: it reads two files your training loop writes
+(`metrics.jsonl` and step-tagged checkpoints) — see
+[docs/TRAINER_CONTRACT.md](docs/TRAINER_CONTRACT.md).
 
 > Status: **beta.** The HTTP API and trainer contract are stabilizing; expect
 > occasional breaking changes before 1.0. AGPL-3.0-or-later.
-
-## Why it's different
-
-- **Agent-ergonomic API.** Every response is one envelope
-  (`{ok, data, errors[], next_actions[]}`) with stable machine-readable error
-  codes and a suggested next call — built to be consumed by a model, not scraped
-  from HTML.
-- **Differential submission.** `submit-from/{parent}` inherits a parent run's
-  whole config and records lineage, so "the last run with one variable changed"
-  is one call, not a 60-line body.
-- **Offline probes.** `probe-from/{parent}` warm-starts from a checkpoint to
-  answer one question cheaply before committing to a full run; `keep_milestones`
-  retention preserves the entry points probes need.
-- **Live control plane.** Change a *running* run's termination policy —
-  `max_steps`, early-stopping, or a graceful checkpointed stop — with no restart.
-- **Declarative gates + self-driving ops.** Metric checks, QC renders,
-  checkpoint retention, and finalize/alerting run from the run's own
-  declarations; results and human conclusions live *with the run*.
-- **One-call session resume.** `brief` and `journal` hand a fresh agent the whole
-  decision context, so there is no external hand-off doc to keep in sync.
-
-The framework is trainer-agnostic: it reads two files your training loop writes
-(`metrics.jsonl` and step-tagged checkpoints). See
-[docs/TRAINER_CONTRACT.md](docs/TRAINER_CONTRACT.md).
 
 ## Install
 
