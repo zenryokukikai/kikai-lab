@@ -46,8 +46,13 @@ The framework is trainer-agnostic: it reads two files your training loop writes
 
 ## Install
 
+Not on PyPI yet — install from source:
+
 ```bash
-pip install kikai-lab          # or: uv add kikai-lab
+pip install "git+https://github.com/zenryokukikai/kikai-lab.git"
+# or, for local development:
+git clone https://github.com/zenryokukikai/kikai-lab.git
+cd kikai-lab && uv sync        # or: pip install -e .
 ```
 
 Python 3.11+. Requires Docker on the host for the training lifecycle; the
