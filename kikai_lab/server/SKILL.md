@@ -71,6 +71,8 @@ curl -X POST $BASE/projects/example_proj/runs/example_run_001/submit \
   "managed": {"max_step": 40000, "retention": {"keep_latest": 3, "keep_best": 2}},
   "dry_run": true}'
 # 7. same body without dry_run -> launches; kikai manages QC/retention/finalize
+#    (a managed submit with managed.delivery_target_id also announces itself:
+#     "[run] training started" with fresh/resume, max_step, and lineage)
 # 8. poll (see below), fetch metrics, artifacts
 ```
 

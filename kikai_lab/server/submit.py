@@ -481,6 +481,67 @@ def ensure_run_dir_relocated(
         )
 
 
+def notify_run_started(
+    path: Path,
+    run_name: str,
+    body: dict[str, Any],
+    lineage: dict[str, Any] | None,
+) -> str | None:
+    """Post a 'training started' notification to the run's delivery target.
+
+    Best-effort by design: the container is already running, so a notification
+    failure must never fail the submit — it returns a warning code instead.
+    notification_id is per-run, so a crash-window resubmit does not double-post
+    (*_record_exists is benign)."""
+    target = (body.get("managed") or {}).get("delivery_target_id")
+    if not target:
+        return None
+    args = [str(a) for a in body.get("args") or []]
+    resume_ckpt = None
+    if "--resume-checkpoint" in args:
+        idx = args.index("--resume-checkpoint")
+        if idx + 1 < len(args):
+            resume_ckpt = Path(args[idx + 1]).name
+    lines = [f"[{run_name}] training started"]
+    detail = []
+    if body.get("experiment_id"):
+        detail.append(f"experiment={body['experiment_id']}")
+    detail.append(f"start={'resume:' + resume_ckpt if resume_ckpt else 'fresh'}")
+    max_step = (body.get("managed") or {}).get("max_step")
+    if max_step:
+        detail.append(f"max_step={max_step}")
+    if body.get("bundle_id"):
+        detail.append(f"bundle={body['bundle_id']}")
+    lines.append(" ".join(detail))
+    if lineage and lineage.get("parent_run"):
+        probe = lineage.get("probe") or {}
+        if probe.get("question"):
+            lines.append(f'probe of {lineage["parent_run"]}: "{probe["question"]}"')
+        else:
+            lines.append(f"derived from {lineage['parent_run']}")
+    op = {
+        "kind": "kikai_operation",
+        "schema_version": 1,
+        "request": {
+            "adapter": "webhook_notification",
+            "operation": f"{run_name}_submit_notify",
+            "project_root": str(path),
+            "notification_id": f"{run_name}_submit_notify",
+            "delivery_target_id": target,
+            "message": "\n".join(lines),
+            "severity": "info",
+            "run_name": run_name,
+        },
+    }
+    try:
+        execute_operation(op)
+    except OperationError as exc:
+        if exc.code.endswith("_record_exists"):
+            return None  # crash-window resubmit: already announced
+        return exc.code
+    return None
+
+
 def build_submit_router(config: ServerConfig) -> APIRouter:
     router = APIRouter(tags=["submit"])
 
@@ -706,6 +767,17 @@ def build_submit_router(config: ServerConfig) -> APIRouter:
                 "parent_run": (_lineage or {}).get("parent_run"),
             },
         )
+        notify_error = notify_run_started(path, run_name, body, _lineage)
+        if notify_error:
+            (warnings := warnings or []).append(
+                error(
+                    "run.start_notification_failed",
+                    "the run launched but its start notification could not be "
+                    "delivered",
+                    blocking=False,
+                    details={"error": notify_error},
+                )
+            )
         return envelope_response(
             ok=True,
             data={

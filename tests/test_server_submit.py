@@ -1116,3 +1116,61 @@ def test_submit_from_refuses_unrelocated_run_dir(tmp_path: Path, monkeypatch) ->
 
     # a parent with no run_dir (unmanaged) is a no-op
     ensure_run_dir_relocated({"args": []}, {"args": []}, "child_run")
+
+
+def test_submit_posts_start_notification(tmp_path: Path, monkeypatch) -> None:
+    """A managed submit with a delivery target announces itself; failure to
+    deliver is a warning, never a failed submit (the container already runs)."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    received: list[bytes] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.append(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            self.send_response(204)
+            self.end_headers()
+        def log_message(self, *a):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv("TEST_WEBHOOK_URL", f"http://127.0.0.1:{server.server_port}/hook")
+
+    client = make_client(tmp_path)
+    prepare_project(tmp_path, client)
+    fake, _, set_control = write_fake_docker(tmp_path)
+    monkeypatch.setenv("KIKAI_DOCKER_BIN", str(fake))
+    set_container_env(monkeypatch, tmp_path)
+    # register a delivery target the notification can resolve
+    (tmp_path / "example_new" / "delivery_targets").mkdir(exist_ok=True)
+    (tmp_path / "example_new" / "delivery_targets" / "example_hook.json").write_text(
+        json.dumps({"schema_version": 1, "kind": "discord_webhook",
+                    "target_id": "example_hook",
+                    "webhook_url": "env:TEST_WEBHOOK_URL"}), encoding="utf-8")
+
+    resp = submit(client, managed={"max_step": 100,
+                                   "retention": {"keep_latest": 2, "keep_best": 1},
+                                   "delivery_target_id": "example_hook"})
+    assert resp.status_code == 201, resp.text
+    assert received, "start notification was not posted"
+    payload = received[0].decode()
+    assert "example_run_a" in payload and "training started" in payload
+    assert "fresh" in payload  # no --resume-checkpoint in args
+    server.shutdown()
+
+    # webhook unreachable -> submit still succeeds, with a non-blocking warning
+    monkeypatch.setenv("TEST_WEBHOOK_URL", "http://127.0.0.1:9/unreachable")
+    set_control(exists=False)
+    resp2 = client.post(
+        "/v1/projects/example_new/runs/example_run_n2/submit",
+        json=submission_body(
+            args=["--run-dir", "${CONTAINER_RUNS_ROOT}/example_run_n2/run"],
+            run_dir="${EXAMPLE_RUNS_ROOT}/example_run_n2/run",
+            managed={"max_step": 100, "retention": {"keep_latest": 1, "keep_best": 1},
+                     "delivery_target_id": "example_hook"}),
+    )
+    assert resp2.status_code == 201, resp2.text
+    codes = [w.get("code") for w in resp2.json()["warnings"]]
+    assert "run.start_notification_failed" in codes
