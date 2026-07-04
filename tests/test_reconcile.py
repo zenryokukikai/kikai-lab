@@ -216,6 +216,70 @@ def test_qc_record_exists_is_idempotent_success(tmp_path):
     assert s["new_qc_steps"] == []            # already delivered, not counted as new
 
 
+def test_qc_post_label_is_prefixed_with_run_name(tmp_path):
+    # QC posts must be attributable to the RUN, not to whatever an author (or an
+    # inherited submit-from body) wrote into --post-label. The run name is system
+    # truth: build_qc_op prepends it unconditionally.
+    project_root = make_registry(tmp_path)
+    run_dir = make_run_dir(tmp_path, ["checkpoint_step_001000_loss0p5.pt"])
+    ckpt = run_dir / "checkpoints" / "checkpoint_step_001000_loss0p5.pt"
+
+    mr = managed_run(run_dir)
+    mr["qc_op"]["request"]["args"] += ["--post-label", "run_OLD diag video"]
+    op = reconcile.build_qc_op(project_root, mr, 1000, ckpt)
+    args = op["request"]["args"]
+    assert args[args.index("--post-label") + 1] == "[r] run_OLD diag video"
+
+    # idempotent: an already-prefixed label is not double-tagged
+    op2 = reconcile.build_qc_op(project_root, {**mr, "qc_op": op}, 1000, ckpt)
+    args2 = op2["request"]["args"]
+    assert args2[args2.index("--post-label") + 1] == "[r] run_OLD diag video"
+
+    # equals-form is tagged too
+    mr_eq = managed_run(run_dir)
+    mr_eq["qc_op"]["request"]["args"] += ["--post-label=stale name"]
+    op3 = reconcile.build_qc_op(project_root, mr_eq, 1000, ckpt)
+    assert "--post-label=[r] stale name" in op3["request"]["args"]
+
+    # nested operation_sequence steps are covered as well
+    mr_seq = managed_run(run_dir)
+    mr_seq["qc_op"] = {
+        "kind": "kikai_operation",
+        "request": {
+            "adapter": "operation_sequence",
+            "operation": "qc",
+            "pipeline_run_id": "qc_step{{step6}}",
+            "project_root": "examples/example_project",
+            "steps": [
+                {"request": {"adapter": "script_bundle_run",
+                             "args": ["--post-label", "inner label"]}}
+            ],
+        },
+    }
+    op4 = reconcile.build_qc_op(project_root, mr_seq, 1000, ckpt)
+    inner = op4["request"]["steps"][0]["request"]["args"]
+    assert inner[inner.index("--post-label") + 1] == "[r] inner label"
+
+    # a --post-label at the end of args (no value) must not crash or eat a flag
+    mr_tail = managed_run(run_dir)
+    mr_tail["qc_op"]["request"]["args"] += ["--post-label"]
+    op5 = reconcile.build_qc_op(project_root, mr_tail, 1000, ckpt)
+    assert op5["request"]["args"][-1] == "--post-label"
+
+
+def test_evaluation_op_post_label_is_prefixed_with_run_name(tmp_path):
+    run_dir = make_run_dir(tmp_path, ["checkpoint_step_001000_loss0p5.pt"])
+    mr = managed_run(run_dir)
+    evaluation = {
+        "eval_id": "e1",
+        "op": {"request": {"adapter": "script_bundle_run",
+                           "args": ["--post-label", "eval video"]}},
+    }
+    op = reconcile.build_evaluation_op(make_registry(tmp_path), mr, evaluation, 1000)
+    args = op["request"]["args"]
+    assert args[args.index("--post-label") + 1] == "[r] eval video"
+
+
 def test_operation_sequence_qc_template_requires_step_varying_pipeline_run_id(tmp_path):
     # C1/C2: an operation_sequence QC op with a constant pipeline_run_id would wedge on
     # sequence_record_exists after the first checkpoint -> reject at build time; in a tick

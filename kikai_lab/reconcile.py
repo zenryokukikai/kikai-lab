@@ -246,6 +246,50 @@ def _substitute(template: Any, mapping: dict[str, str]) -> Any:
     return template
 
 
+def _prepend_run_label(op: Any, run_id: str) -> Any:
+    """Force every ``--post-label`` value in the op to lead with ``[<run name>]``.
+
+    QC/eval posts (e.g. Discord uploads) are labeled by author-written strings.
+    When a run is derived (submit-from/probe-from), a hand-written label that
+    embeds an INFORMAL ancestor name (``exp7`` for parent ``exp7_baseline``)
+    survives rebinding — rebind only rewrites the full run name — and the posts
+    get attributed to the wrong run. The run name is system truth, so prepend
+    it unconditionally instead of trusting authors. Idempotent: an already-prefixed
+    label is left alone. Handles both ``--post-label VALUE`` and
+    ``--post-label=VALUE`` arg forms, at any nesting depth (operation_sequence
+    steps included).
+    """
+    prefix = f"[{run_id}]"
+
+    def tag(value: str) -> str:
+        # boundary-aware idempotency: "run_OLD ..." must NOT count as already
+        # tagged for run_id "r" (bare startswith would match any shared prefix)
+        if value.startswith(prefix) or value == run_id or value.startswith(f"{run_id} "):
+            return value
+        return f"{prefix} {value}"
+
+    if isinstance(op, list):
+        out = []
+        expect_value = False
+        for item in op:
+            if expect_value and isinstance(item, str) and not item.startswith("--"):
+                out.append(tag(item))
+                expect_value = False
+                continue
+            expect_value = False
+            if isinstance(item, str) and item == "--post-label":
+                expect_value = True
+                out.append(item)
+            elif isinstance(item, str) and item.startswith("--post-label="):
+                out.append("--post-label=" + tag(item[len("--post-label="):]))
+            else:
+                out.append(_prepend_run_label(item, run_id))
+        return out
+    if isinstance(op, dict):
+        return {k: _prepend_run_label(v, run_id) for k, v in op.items()}
+    return op
+
+
 def load_qc_template(project_root: Path, managed_run: dict[str, Any]) -> dict[str, Any] | None:
     """The QC op template, inline (``qc_op``) or from a file (``qc_op_template`` path)."""
     inline = managed_run.get("qc_op")
@@ -282,7 +326,9 @@ def build_qc_op(
         "checkpoint_name": Path(checkpoint_path).name,
         "run_id": str(managed_run.get("run_id", "")),
     }
-    return _substitute(template, mapping)
+    rendered = _substitute(template, mapping)
+    run_id = str(managed_run.get("run_id", ""))
+    return _prepend_run_label(rendered, run_id) if run_id else rendered
 
 
 def _validate_qc_template(template: dict[str, Any]) -> None:
@@ -548,7 +594,9 @@ def build_evaluation_op(
         "run_id": str(managed_run.get("run_id", "")),
         "eval_id": str(evaluation.get("eval_id", "")),
     }
-    return _substitute(template, mapping)
+    rendered = _substitute(template, mapping)
+    run_id = str(managed_run.get("run_id", ""))
+    return _prepend_run_label(rendered, run_id) if run_id else rendered
 
 
 def run_metric_checks(
