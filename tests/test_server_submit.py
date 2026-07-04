@@ -1174,3 +1174,27 @@ def test_submit_posts_start_notification(tmp_path: Path, monkeypatch) -> None:
     assert resp2.status_code == 201, resp2.text
     codes = [w.get("code") for w in resp2.json()["warnings"]]
     assert "run.start_notification_failed" in codes
+
+    # resume submissions announce the checkpoint BASENAME (no paths leak)
+    monkeypatch.setenv("TEST_WEBHOOK_URL", f"http://127.0.0.1:{server.server_port}/hook")
+    received.clear()
+    server3 = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server3.serve_forever, daemon=True).start()
+    monkeypatch.setenv("TEST_WEBHOOK_URL", f"http://127.0.0.1:{server3.server_port}/hook")
+    set_control(exists=False)
+    resp3 = client.post(
+        "/v1/projects/example_new/runs/example_run_n3/submit",
+        json=submission_body(
+            args=["--run-dir", "${CONTAINER_RUNS_ROOT}/example_run_n3/run",
+                  "--resume-checkpoint",
+                  "${CONTAINER_RUNS_ROOT}/example_run_a/run/checkpoints/best_step_000060_loss1p5.pt"],
+            run_dir="${EXAMPLE_RUNS_ROOT}/example_run_n3/run",
+            managed={"max_step": 100, "retention": {"keep_latest": 1, "keep_best": 1},
+                     "delivery_target_id": "example_hook"}),
+    )
+    assert resp3.status_code == 201, resp3.text
+    assert received, "resume notification missing"
+    payload3 = received[0].decode()
+    assert "resume:best_step_000060_loss1p5.pt" in payload3
+    assert "CONTAINER_RUNS_ROOT" not in payload3  # basename only, no path
+    server3.shutdown()

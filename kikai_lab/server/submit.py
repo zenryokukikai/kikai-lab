@@ -516,7 +516,8 @@ def notify_run_started(
     if lineage and lineage.get("parent_run"):
         probe = lineage.get("probe") or {}
         if probe.get("question"):
-            lines.append(f'probe of {lineage["parent_run"]}: "{probe["question"]}"')
+            q = str(probe["question"])[:200]
+            lines.append(f'probe of {lineage["parent_run"]}: "{q}"')
         else:
             lines.append(f"derived from {lineage['parent_run']}")
     op = {
@@ -528,7 +529,7 @@ def notify_run_started(
             "project_root": str(path),
             "notification_id": f"{run_name}_submit_notify",
             "delivery_target_id": target,
-            "message": "\n".join(lines),
+            "message": "\n".join(lines)[:1900],  # discord hard limit is 2000
             "severity": "info",
             "run_name": run_name,
         },
@@ -539,6 +540,9 @@ def notify_run_started(
         if exc.code.endswith("_record_exists"):
             return None  # crash-window resubmit: already announced
         return exc.code
+    except Exception as exc:  # noqa: BLE001 — the container is already running;
+        # a corrupt hand-edited target record or a full disk must not 500 the submit
+        return f"unexpected:{type(exc).__name__}"
     return None
 
 
