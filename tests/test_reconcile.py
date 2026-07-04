@@ -267,6 +267,38 @@ def test_qc_post_label_is_prefixed_with_run_name(tmp_path):
     assert op5["request"]["args"][-1] == "--post-label"
 
 
+def test_qc_delivery_message_is_prefixed_with_run_name(tmp_path):
+    # Review finding: artifact_delivery / webhook_notification steps carry the
+    # post text in a free `message` field — same author-written attribution
+    # channel as --post-label, same unconditional tag.
+    project_root = make_registry(tmp_path)
+    run_dir = make_run_dir(tmp_path, ["checkpoint_step_001000_loss0p5.pt"])
+    ckpt = run_dir / "checkpoints" / "checkpoint_step_001000_loss0p5.pt"
+    mr = managed_run(run_dir)
+    mr["qc_op"] = {
+        "kind": "kikai_operation",
+        "request": {
+            "adapter": "operation_sequence",
+            "operation": "qc",
+            "pipeline_run_id": "qc_step{{step6}}",
+            "project_root": "examples/example_project",
+            "steps": [
+                {"request": {"adapter": "artifact_delivery",
+                             "message": "step {{step6}} video"}},
+                {"request": {"adapter": "webhook_notification",
+                             "message": "[r] already tagged"}},
+                # a non-delivery adapter's `message` is NOT touched
+                {"request": {"adapter": "docker_exec", "message": "keep me"}},
+            ],
+        },
+    }
+    op = reconcile.build_qc_op(project_root, mr, 1000, ckpt)
+    steps = op["request"]["steps"]
+    assert steps[0]["request"]["message"] == "[r] step 001000 video"
+    assert steps[1]["request"]["message"] == "[r] already tagged"  # idempotent
+    assert steps[2]["request"]["message"] == "keep me"
+
+
 def test_evaluation_op_post_label_is_prefixed_with_run_name(tmp_path):
     run_dir = make_run_dir(tmp_path, ["checkpoint_step_001000_loss0p5.pt"])
     mr = managed_run(run_dir)

@@ -286,7 +286,15 @@ def _prepend_run_label(op: Any, run_id: str) -> Any:
                 out.append(_prepend_run_label(item, run_id))
         return out
     if isinstance(op, dict):
-        return {k: _prepend_run_label(v, run_id) for k, v in op.items()}
+        out_d = {k: _prepend_run_label(v, run_id) for k, v in op.items()}
+        # the daemon's own delivery adapters carry the post text in a free
+        # `message` field — the same author-written attribution channel as
+        # --post-label, so it gets the same unconditional tag
+        if out_d.get("adapter") in ("artifact_delivery", "webhook_notification") and isinstance(
+            out_d.get("message"), str
+        ):
+            out_d["message"] = tag(out_d["message"])
+        return out_d
     return op
 
 
