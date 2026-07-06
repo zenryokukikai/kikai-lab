@@ -126,6 +126,108 @@ def submission_record(
     return record
 
 
+def _validate_bundle_entrypoint_ref(
+    path: Path, bundle_id: str, entrypoint: str, *, where: str
+) -> None:
+    """Wrap load_script_bundle + script_bundle_entrypoint_argv with a context tag
+    on the error so a typo in a qc_op or probe reports which reference failed —
+    a common accident where an entrypoint typo in qc_op only surfaced at the
+    reconciler's first tick (many checkpoints of silent QC failure) is prevented
+    by running this at submit time."""
+    try:
+        bundle, _ = load_script_bundle(path, bundle_id)
+        script_bundle_entrypoint_argv(bundle, bundle_id, entrypoint)
+    except OperationError as exc:
+        details = dict(exc.details or {})
+        details["where"] = where
+        raise OperationError(exc.code, f"[{where}] {exc.message}", details) from exc
+
+
+def _validate_probes_field(path: Path, managed: dict[str, Any]) -> None:
+    """Static checks for managed.probes[]. Structural (types/uniqueness) + reference
+    checks (each probe's bundle/entrypoint/container must exist). Missing references
+    are the class of failure the reconciler discovers per-checkpoint; catching them
+    here means a bad probe blows up the submit, not 60 downstream QC ticks."""
+    probes = managed.get("probes")
+    if probes is None:
+        return
+    if not isinstance(probes, list):
+        raise OperationError(
+            "run.record_invalid", "managed.probes must be an array",
+            {"got_type": type(probes).__name__},
+        )
+    seen_ids: set[str] = set()
+    for i, probe in enumerate(probes):
+        if not isinstance(probe, dict):
+            raise OperationError(
+                "run.record_invalid",
+                f"managed.probes[{i}] must be an object",
+                {"index": i},
+            )
+        pid = probe.get("id")
+        if not isinstance(pid, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", pid):
+            raise OperationError(
+                "run.record_invalid",
+                f"managed.probes[{i}].id must match [A-Za-z0-9._-]+",
+                {"index": i, "id": pid},
+            )
+        if pid in seen_ids:
+            raise OperationError(
+                "run.record_invalid",
+                f"managed.probes has duplicate id {pid!r} at index {i}",
+                {"index": i, "id": pid},
+            )
+        seen_ids.add(pid)
+        for req in ("bundle_id", "entrypoint", "container_id", "project_root"):
+            if not probe.get(req):
+                raise OperationError(
+                    "run.record_invalid",
+                    f"managed.probes[{i}].{req} is required (probe id={pid!r})",
+                    {"index": i, "id": pid, "missing": req},
+                )
+        if not isinstance(probe.get("args"), list):
+            raise OperationError(
+                "run.record_invalid",
+                f"managed.probes[{i}].args must be an array (probe id={pid!r})",
+                {"index": i, "id": pid},
+            )
+        every = probe.get("every_steps")
+        if every is not None and (not isinstance(every, int) or every <= 0):
+            raise OperationError(
+                "run.record_invalid",
+                f"managed.probes[{i}].every_steps must be a positive integer",
+                {"index": i, "id": pid, "every_steps": every},
+            )
+        # reference checks
+        _validate_bundle_entrypoint_ref(
+            path, str(probe["bundle_id"]), str(probe["entrypoint"]),
+            where=f"managed.probes[{i}] id={pid!r}",
+        )
+        container_id = str(probe["container_id"])
+        container = load_container_record(path, container_id)
+        docker_name_from_container(container, container_id)
+
+
+def _validate_qc_op_refs(path: Path, managed: dict[str, Any]) -> None:
+    """The primary qc_op has the same class of typo risk as probes — a wrong
+    entrypoint here silently fails on every checkpoint. Validate at submit."""
+    qc_op = managed.get("qc_op")
+    if not isinstance(qc_op, dict):
+        return
+    request = qc_op.get("request")
+    if not isinstance(request, dict):
+        return
+    # only script_bundle_run / script_bundle_exec have bundle+entrypoint pairs at the
+    # top level; nested operation_sequence steps are the author's responsibility (they
+    # ship in bundles that MAY not be locally resolvable — same convention as today).
+    adapter = request.get("adapter")
+    if adapter in ("script_bundle_run", "script_bundle_exec"):
+        bundle_id = request.get("bundle_id")
+        entrypoint = request.get("entrypoint")
+        if bundle_id and entrypoint:
+            _validate_bundle_entrypoint_ref(path, str(bundle_id), str(entrypoint), where="managed.qc_op")
+
+
 def validate_submission_pieces(
     config: ServerConfig, path: Path, body: dict[str, Any]
 ) -> None:
@@ -142,6 +244,9 @@ def validate_submission_pieces(
     docker_name_from_container(container, body["container_id"])
     bundle, _ = load_script_bundle(path, body["bundle_id"])
     script_bundle_entrypoint_argv(bundle, body["bundle_id"], body["entrypoint"])
+    managed_for_refs = body.get("managed") or {}
+    _validate_qc_op_refs(path, managed_for_refs)
+    _validate_probes_field(path, managed_for_refs)
     experiment_id = body.get("experiment_id")
     if experiment_id and not (path / "experiments" / f"{experiment_id}.yaml").is_file():
         raise OperationError(
@@ -180,7 +285,7 @@ def managed_run_record(run_name: str, body: dict[str, Any]) -> dict[str, Any]:
     ):
         if managed.get(key) is not None:
             record[key] = managed[key]
-    for key in ("retention", "qc_op_template", "qc_op", "evaluations", "metric_checks"):
+    for key in ("retention", "qc_op_template", "qc_op", "evaluations", "metric_checks", "probes"):
         if managed.get(key) is not None:
             record[key] = managed[key]
     validate_record_schema(record, "managed_run", kind="managed_run")

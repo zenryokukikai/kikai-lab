@@ -339,6 +339,42 @@ def build_qc_op(
     return _prepend_run_label(rendered, run_id) if run_id else rendered
 
 
+def build_probe_op(
+    project_root: Path,
+    managed_run: dict[str, Any],
+    probe: dict[str, Any],
+    step: int,
+    checkpoint_path: Path,
+) -> dict[str, Any]:
+    """Compile a flat probes[] entry into a script_bundle_run kikai_operation
+    with the same template substitutions as qc_op ({{step}}, {{step6}},
+    {{checkpoint_name}}, {{run_id}}). Same run-label prepend rule as qc_op so
+    Discord posts start with '[run_id]' regardless of the label the author wrote."""
+    run_id = str(managed_run.get("run_id", ""))
+    probe_id = str(probe["id"])
+    default_operation = f"{run_id}_{probe_id}_step{{{{step6}}}}"
+    request: dict[str, Any] = {
+        "adapter": "script_bundle_run",
+        "operation": str(probe.get("operation") or default_operation),
+        "bundle_id": str(probe["bundle_id"]),
+        "container_id": str(probe["container_id"]),
+        "entrypoint": str(probe["entrypoint"]),
+        "project_root": str(probe["project_root"]),
+        "args": list(probe.get("args") or []),
+    }
+    if probe.get("env"):
+        request["env"] = dict(probe["env"])
+    op = {"kind": "kikai_operation", "request": request, "schema_version": 1}
+    mapping = {
+        "step": str(step),
+        "step6": f"{step:06d}",
+        "checkpoint_name": Path(checkpoint_path).name,
+        "run_id": run_id,
+    }
+    rendered = _substitute(op, mapping)
+    return _prepend_run_label(rendered, run_id) if run_id else rendered
+
+
 def _validate_qc_template(template: dict[str, Any]) -> None:
     """An ``operation_sequence`` QC op writes a one-shot ``pipeline_runs/<id>.json`` record
     and refuses to overwrite it, so its ``pipeline_run_id`` MUST vary per checkpoint (embed
@@ -930,6 +966,70 @@ def tick(
                     "qc artifact ledger write failed"
                 )
         write_progress(project_root, run_id, progress)
+
+    # 2a2. per-checkpoint probes (additional QC ops declared alongside qc_op).
+    # Each probe runs INDEPENDENTLY: a failure or a missing bundle-entrypoint on
+    # one probe does not block others or the primary qc_op. Progress is tracked
+    # per probe id in progress.probes_done_steps, so a probe added mid-run
+    # backfills only from its own perspective without re-running qc_op.
+    probes = managed_run.get("probes") or []
+    summary["probe_errors"] = []
+    summary.setdefault("new_probe_steps", {})
+    for probe in probes:
+        probe_id = str(probe.get("id") or "")
+        if not probe_id:
+            continue
+        every = probe.get("every_steps")
+        probes_done_all = progress.setdefault("probes_done_steps", {})
+        p_done = set(probes_done_all.get(probe_id) or [])
+        new_for_probe: list[int] = []
+        for step, cpath in checkpoint_steps(run_dir):
+            if step in p_done:
+                continue
+            if max_step is not None and step > int(max_step):
+                continue
+            if every is not None and int(step) % int(every) != 0:
+                continue
+            try:
+                probe_op = build_probe_op(project_root, managed_run, probe, step, cpath)
+            except OperationError as exc:
+                summary["probe_errors"].append(
+                    {"probe_id": probe_id, "step": step, "error": exc.code}
+                )
+                tick_had_error = True
+                progress["last_error"] = f"probe {probe_id}@{step}: {exc.code}"
+                continue
+            _clear_incomplete_qc_record(project_root, probe_op)
+            try:
+                execute(probe_op)
+            except OperationError as exc:
+                if exc.code.endswith("_record_exists"):
+                    pass
+                elif exc.code == "operation.sequence_step_failed" and _inner_step_already_recorded(
+                    exc, probe_op
+                ):
+                    pass
+                else:
+                    summary["probe_errors"].append(
+                        {"probe_id": probe_id, "step": step, "error": exc.code}
+                    )
+                    tick_had_error = True
+                    progress["last_error"] = f"probe {probe_id}@{step}: {exc.code}"
+                    continue
+            except Exception as exc:  # adapter bug — isolate to this probe
+                summary["probe_errors"].append(
+                    {"probe_id": probe_id, "step": step,
+                     "error": f"reconcile.probe_exec_failed:{type(exc).__name__}"}
+                )
+                tick_had_error = True
+                progress["last_error"] = f"probe {probe_id}@{step}: {str(exc)[:120]}"
+                continue
+            p_done.add(step)
+            new_for_probe.append(step)
+            probes_done_all[probe_id] = sorted(p_done)
+            write_progress(project_root, run_id, progress)
+        if new_for_probe:
+            summary["new_probe_steps"][probe_id] = new_for_probe
 
     # 2b. declarative evaluations (measurement ops) + metric checks — the agent
     # declares once; the daemon babysits the hypothesis.

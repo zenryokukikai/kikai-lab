@@ -118,6 +118,10 @@
         },
         "metric_checks": {
           "type": "array"
+        },
+        "probes": {
+          "description": "Additional per-checkpoint QC ops declared inline. Each is compiled server-side into a script_bundle_run and executed alongside qc_op with independent progress tracking (probes_done_steps[id]).",
+          "type": "array"
         }
       }
     },

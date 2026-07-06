@@ -267,6 +267,121 @@ def test_qc_post_label_is_prefixed_with_run_name(tmp_path):
     assert op5["request"]["args"][-1] == "--post-label"
 
 
+def _probe(pid, bundle_id="probe_bundle", entrypoint="probe_ep", every_steps=None,
+           post_label=None):
+    args = [
+        "--cotrain-checkpoint",
+        "${CONTAINER_TRAINING_RUNS_ROOT}/r/checkpoints/{{checkpoint_name}}",
+        "--out",
+        "${CONTAINER_TRAINING_RUNS_ROOT}/r/qc/probes/" + pid + "/step{{step6}}.mp4",
+    ]
+    if post_label is not None:
+        args += ["--post-label", post_label]
+    p = {
+        "id": pid,
+        "bundle_id": bundle_id,
+        "entrypoint": entrypoint,
+        "container_id": "qc_runner",
+        "project_root": "/project",
+        "args": args,
+    }
+    if every_steps is not None:
+        p["every_steps"] = every_steps
+    return p
+
+
+def test_probes_run_at_each_new_checkpoint_and_are_idempotent(tmp_path):
+    project_root = make_registry(tmp_path)
+    run_dir = make_run_dir(tmp_path, [
+        "checkpoint_step_001000_loss0p5.pt",
+        "checkpoint_step_002000_loss0p4.pt",
+    ])
+    mr = managed_run(run_dir, probes=[_probe("heldout")])
+    ex = FakeExec()
+    s1 = reconcile.tick(project_root, mr, reconcile.default_progress("r"),
+                        execute=ex, inspect=fake_inspect(running=True))
+    # qc_op still fires once per checkpoint; probes add extra script_bundle_run calls
+    qc = ex.qc_calls()
+    heldout = [c for c in qc if c.get("bundle_id") == "probe_bundle"]
+    assert len(heldout) == 2, "one probe execution per new checkpoint"
+    # substitution + no leftover placeholders
+    assert "step001000" in json.dumps(heldout[0]) and "step002000" in json.dumps(heldout[1])
+    assert "{{" not in json.dumps(heldout)
+    # progress recorded per probe id
+    prog = reconcile.load_progress(project_root, "r")
+    assert prog["probes_done_steps"] == {"heldout": [1000, 2000]}
+    assert s1["new_probe_steps"] == {"heldout": [1000, 2000]}
+
+    # second tick — no duplicates
+    ex2 = FakeExec()
+    s2 = reconcile.tick(project_root, mr, prog, execute=ex2, inspect=fake_inspect(running=True))
+    assert not [c for c in ex2.qc_calls() if c.get("bundle_id") == "probe_bundle"]
+    assert s2["new_probe_steps"] == {}
+
+
+def test_probes_every_steps_gates_execution(tmp_path):
+    project_root = make_registry(tmp_path)
+    run_dir = make_run_dir(tmp_path, [
+        "checkpoint_step_001000_loss0p5.pt",
+        "checkpoint_step_002000_loss0p4.pt",
+        "checkpoint_step_003000_loss0p3.pt",
+        "checkpoint_step_004000_loss0p2.pt",
+    ])
+    mr = managed_run(run_dir, probes=[_probe("heldout", every_steps=2000)])
+    ex = FakeExec()
+    reconcile.tick(project_root, mr, reconcile.default_progress("r"),
+                   execute=ex, inspect=fake_inspect(running=True))
+    steps_run = sorted(
+        int(s) for c in ex.qc_calls() if c.get("bundle_id") == "probe_bundle"
+        for s in [json.dumps(c).split("step")[-1].split(".mp4")[0].lstrip("0") or "0"]
+    )
+    assert steps_run == [2000, 4000], "only checkpoints where step % every_steps == 0"
+
+
+def test_one_probe_failure_isolated_from_others_and_qc(tmp_path):
+    project_root = make_registry(tmp_path)
+    run_dir = make_run_dir(tmp_path, ["checkpoint_step_001000_loss0p5.pt"])
+    good = _probe("good_probe", bundle_id="good_bundle")
+    bad = _probe("bad_probe", bundle_id="bad_bundle")
+    mr = managed_run(run_dir, probes=[bad, good])
+
+    # FakeExec's failure keyed on adapter; make the bad probe fail via a distinct
+    # exec that inspects bundle_id.
+    class SelectiveExec(FakeExec):
+        def __call__(self, op):
+            request = op["request"]
+            if request.get("bundle_id") == "bad_bundle":
+                self.calls.append(request)
+                raise OperationError("test.bad_probe_failed", "forced")
+            return super().__call__(op)
+
+    ex = SelectiveExec()
+    s = reconcile.tick(project_root, mr, reconcile.default_progress("r"),
+                       execute=ex, inspect=fake_inspect(running=True))
+    prog = reconcile.load_progress(project_root, "r")
+    # qc_op still fired (diag_bundle)
+    assert any(c.get("bundle_id") == "diag_bundle" for c in ex.qc_calls())
+    # good probe fired
+    assert any(c.get("bundle_id") == "good_bundle" for c in ex.qc_calls())
+    # bad probe error recorded, no progress advance for it
+    assert prog["probes_done_steps"].get("good_probe") == [1000]
+    assert prog["probes_done_steps"].get("bad_probe") in (None, [])
+    assert any(e["probe_id"] == "bad_probe" for e in s["probe_errors"])
+
+
+def test_probe_op_prepended_with_run_label(tmp_path):
+    project_root = make_registry(tmp_path)
+    run_dir = make_run_dir(tmp_path, ["checkpoint_step_001000_loss0p5.pt"])
+    mr = managed_run(run_dir, probes=[_probe("heldout", post_label="TTS 1080p")])
+    ex = FakeExec()
+    reconcile.tick(project_root, mr, reconcile.default_progress("r"),
+                   execute=ex, inspect=fake_inspect(running=True))
+    probe_calls = [c for c in ex.qc_calls() if c.get("bundle_id") == "probe_bundle"]
+    args = probe_calls[0]["args"]
+    label = args[args.index("--post-label") + 1]
+    assert label.startswith("[r] "), f"expected run label prepended, got {label!r}"
+
+
 def test_qc_delivery_message_is_prefixed_with_run_name(tmp_path):
     # Review finding: artifact_delivery / webhook_notification steps carry the
     # post text in a free `message` field — same author-written attribution

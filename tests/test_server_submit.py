@@ -1198,3 +1198,139 @@ def test_submit_posts_start_notification(tmp_path: Path, monkeypatch) -> None:
     assert "resume:best_step_000060_loss1p5.pt" in payload3
     assert "CONTAINER_RUNS_ROOT" not in payload3  # basename only, no path
     server3.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# managed.probes[]: per-checkpoint additional QC ops, statically validated
+# --------------------------------------------------------------------------- #
+def _valid_probe(pid: str = "heldout", entrypoint: str = "train") -> dict:
+    return {
+        "id": pid,
+        "bundle_id": "example_trainer_v1",
+        "entrypoint": entrypoint,
+        "container_id": "example_training",
+        "project_root": "/project",
+        "args": ["--out", "${CONTAINER_RUNS_ROOT}/r/qc/{{step6}}.mp4"],
+    }
+
+
+def _make_probe_client(tmp_path: Path, monkeypatch):
+    client = make_client(tmp_path)
+    prepare_project(tmp_path, client)
+    fake, _read_argv, _ = write_fake_docker(tmp_path)
+    monkeypatch.setenv("KIKAI_DOCKER_BIN", str(fake))
+    set_container_env(monkeypatch, tmp_path)
+    return client
+
+
+def test_probes_valid_submit_stores_them_in_managed_run(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    resp = submit(client, managed={"max_step": 100,
+                                   "retention": {"keep_latest": 2, "keep_best": 1},
+                                   "probes": [_valid_probe(), _valid_probe(pid="another")]})
+    assert resp.status_code == 201, resp.text
+    mr_path = tmp_path / "example_new" / "managed_runs" / "example_run_a.yaml"
+    mr = yaml.safe_load(mr_path.read_text())
+    assert isinstance(mr.get("probes"), list) and len(mr["probes"]) == 2
+    assert [p["id"] for p in mr["probes"]] == ["heldout", "another"]
+
+
+def test_probes_bad_bundle_rejected_at_submit(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    p = _valid_probe()
+    p["bundle_id"] = "nonexistent_bundle"
+    resp = submit(client, managed={"max_step": 100,
+                                   "retention": {"keep_latest": 1, "keep_best": 1},
+                                   "probes": [p]})
+    assert resp.status_code != 201
+    body = resp.json()
+    err = body["errors"][0]
+    assert "not_found" in err["code"] or "script_bundle_missing" in err["code"], err
+    details = err.get("details") or {}
+    assert details.get("where", "").startswith("managed.probes[0]")
+
+
+def test_probes_bad_entrypoint_rejected_at_submit(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    p = _valid_probe(entrypoint="typo_entrypoint")
+    resp = submit(client, managed={"max_step": 100,
+                                   "retention": {"keep_latest": 1, "keep_best": 1},
+                                   "probes": [p]})
+    assert resp.status_code != 201
+    err = resp.json()["errors"][0]
+    assert "entrypoint_missing" in err["code"], err
+    assert (err.get("details") or {}).get("where", "").startswith("managed.probes[0]")
+
+
+def test_probes_bad_container_rejected_at_submit(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    p = _valid_probe()
+    p["container_id"] = "nonexistent_container"
+    resp = submit(client, managed={"max_step": 100,
+                                   "retention": {"keep_latest": 1, "keep_best": 1},
+                                   "probes": [p]})
+    assert resp.status_code != 201
+    err = resp.json()["errors"][0]
+    assert "not_found" in err["code"] or "container_missing" in err["code"], err
+
+
+def test_probes_duplicate_ids_rejected(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    resp = submit(client, managed={"max_step": 100,
+                                   "retention": {"keep_latest": 1, "keep_best": 1},
+                                   "probes": [_valid_probe(), _valid_probe()]})
+    assert resp.status_code != 201
+    err = resp.json()["errors"][0]
+    assert err["code"] == "run.record_invalid"
+    assert "duplicate id" in err["message"]
+
+
+def test_probes_missing_required_field_rejected(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    p = _valid_probe()
+    del p["entrypoint"]
+    resp = submit(client, managed={"max_step": 100,
+                                   "retention": {"keep_latest": 1, "keep_best": 1},
+                                   "probes": [p]})
+    assert resp.status_code != 201
+    err = resp.json()["errors"][0]
+    assert err["code"] == "run.record_invalid"
+    assert "entrypoint is required" in err["message"]
+
+
+def test_probes_bad_id_pattern_rejected(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    p = _valid_probe(pid="has spaces")
+    resp = submit(client, managed={"max_step": 100,
+                                   "retention": {"keep_latest": 1, "keep_best": 1},
+                                   "probes": [p]})
+    assert resp.status_code != 201
+    err = resp.json()["errors"][0]
+    assert err["code"] == "run.record_invalid" and "id must match" in err["message"]
+
+
+def test_qc_op_bad_entrypoint_rejected_at_submit(tmp_path: Path, monkeypatch) -> None:
+    """Common accident (qc_op referenced a bundle that had no such entrypoint,
+    so every checkpoint's QC silently failed for many ticks) is now caught at
+    submit time, not runtime."""
+    client = _make_probe_client(tmp_path, monkeypatch)
+    qc_op = {
+        "kind": "kikai_operation",
+        "request": {
+            "adapter": "script_bundle_run",
+            "operation": "qc_step{{step6}}",
+            "bundle_id": "example_trainer_v1",
+            "entrypoint": "diag_that_does_not_exist",
+            "container_id": "example_training",
+            "project_root": "/project",
+            "args": ["--out", "x"],
+        },
+        "schema_version": 1,
+    }
+    resp = submit(client, managed={"max_step": 100,
+                                   "retention": {"keep_latest": 1, "keep_best": 1},
+                                   "qc_op": qc_op})
+    assert resp.status_code != 201
+    err = resp.json()["errors"][0]
+    assert "entrypoint_missing" in err["code"], err
+    assert (err.get("details") or {}).get("where") == "managed.qc_op"
