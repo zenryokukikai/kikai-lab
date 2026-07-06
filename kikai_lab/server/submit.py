@@ -139,7 +139,12 @@ def _validate_bundle_entrypoint_ref(
         script_bundle_entrypoint_argv(bundle, bundle_id, entrypoint)
     except OperationError as exc:
         details = dict(exc.details or {})
-        details["where"] = where
+        # preserve an inner 'where' if the inner code already set one (rare but
+        # possible in nested validation) — this outer context becomes 'outer_where'
+        if "where" in details:
+            details.setdefault("outer_where", where)
+        else:
+            details["where"] = where
         raise OperationError(exc.code, f"[{where}] {exc.message}", details) from exc
 
 
@@ -197,6 +202,20 @@ def _validate_probes_field(path: Path, managed: dict[str, Any]) -> None:
                 "run.record_invalid",
                 f"managed.probes[{i}].every_steps must be a positive integer",
                 {"index": i, "id": pid, "every_steps": every},
+            )
+        # A user-supplied operation string MUST vary with step. Two ticks writing the
+        # same operation id collide in the ops ledger and the second is silently
+        # rejected — silently missing QC is the very failure mode probes[] exists to
+        # eliminate. Omit `operation` to get the safe default (run_id + probe_id + step6).
+        op_tpl = probe.get("operation")
+        if isinstance(op_tpl, str) and (
+            "{{step}}" not in op_tpl and "{{step6}}" not in op_tpl
+        ):
+            raise OperationError(
+                "run.record_invalid",
+                f"managed.probes[{i}].operation must embed {{step}} or {{step6}} to "
+                "vary per checkpoint (omit for the safe default)",
+                {"index": i, "id": pid, "operation": op_tpl},
             )
         # reference checks
         _validate_bundle_entrypoint_ref(

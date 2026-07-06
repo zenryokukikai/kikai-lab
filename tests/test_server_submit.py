@@ -1309,6 +1309,30 @@ def test_probes_bad_id_pattern_rejected(tmp_path: Path, monkeypatch) -> None:
     assert err["code"] == "run.record_invalid" and "id must match" in err["message"]
 
 
+def test_probes_constant_operation_rejected(tmp_path: Path, monkeypatch) -> None:
+    """A constant `operation` string collides across checkpoints in the ops ledger;
+    only the first checkpoint's probe would be recorded, silently dropping the rest."""
+    client = _make_probe_client(tmp_path, monkeypatch)
+    p = _valid_probe()
+    p["operation"] = "my_probe_op_fixed"
+    resp = submit(client, managed={"max_step": 100,
+                                   "retention": {"keep_latest": 1, "keep_best": 1},
+                                   "probes": [p]})
+    assert resp.status_code != 201
+    err = resp.json()["errors"][0]
+    assert err["code"] == "run.record_invalid" and "must embed" in err["message"]
+
+
+def test_probes_step_varying_operation_accepted(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    p = _valid_probe()
+    p["operation"] = "custom_{{step6}}_diag"
+    resp = submit(client, managed={"max_step": 100,
+                                   "retention": {"keep_latest": 1, "keep_best": 1},
+                                   "probes": [p]})
+    assert resp.status_code == 201, resp.text
+
+
 def test_qc_op_bad_entrypoint_rejected_at_submit(tmp_path: Path, monkeypatch) -> None:
     """Common accident (qc_op referenced a bundle that had no such entrypoint,
     so every checkpoint's QC silently failed for many ticks) is now caught at
