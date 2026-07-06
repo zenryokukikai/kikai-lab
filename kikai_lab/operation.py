@@ -1722,8 +1722,28 @@ def docker_run_command(
     # and teardown-by-name silently matches nothing, orphaning the GPU.
     docker_meta = container.get("docker")
     declared_name = docker_meta.get("name") if isinstance(docker_meta, dict) else None
+    ephemeral = bool(isinstance(docker_meta, dict) and docker_meta.get("ephemeral"))
+    suffix = request.get("container_name_suffix")
+    if isinstance(suffix, str) and suffix and not ephemeral:
+        # Suffixing a NON-ephemeral container would silently orphan its persistent
+        # name — refuse loudly instead. Persistent training containers use the
+        # base name for teardown/inspect; suffixing them breaks stop-by-name.
+        raise OperationError(
+            "operation.container_name_suffix_not_ephemeral",
+            "container_name_suffix requires container.docker.ephemeral=true",
+            {"container_id": container_id, "suffix": suffix},
+        )
     if isinstance(declared_name, str) and declared_name:
         resolved_name = resolve_text_ref(declared_name)
+        if ephemeral and isinstance(suffix, str) and suffix:
+            # Per-invocation uniqueness for ephemeral containers: mangling and
+            # length-bound the suffix so the composed --name always stays under
+            # docker's 63-char limit and matches _SAFE_CONTAINER_NAME.
+            safe_suffix = re.sub(r"[^A-Za-z0-9_.-]", "_", suffix)[:50]
+            # keep total <=63 chars (docker limit); truncate base if forced
+            max_base = 63 - len(safe_suffix) - 2   # 2 for "__"
+            base = resolved_name[:max(1, max_base)]
+            resolved_name = f"{base}__{safe_suffix}"
         if _SAFE_CONTAINER_NAME.match(resolved_name):
             command.extend(["--name", resolved_name])
     gpus = container.get("gpus")

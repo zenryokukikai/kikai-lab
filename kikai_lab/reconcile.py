@@ -336,6 +336,7 @@ def build_qc_op(
     }
     rendered = _substitute(template, mapping)
     run_id = str(managed_run.get("run_id", ""))
+    _apply_ephemeral_suffix(project_root, rendered, f"step{step:06d}")
     return _prepend_run_label(rendered, run_id) if run_id else rendered
 
 
@@ -372,7 +373,47 @@ def build_probe_op(
         "run_id": run_id,
     }
     rendered = _substitute(op, mapping)
+    _apply_ephemeral_suffix(project_root, rendered, f"step{step:06d}__probe_{probe_id}")
     return _prepend_run_label(rendered, run_id) if run_id else rendered
+
+
+def _apply_ephemeral_suffix(
+    project_root: Path, op_or_request: dict[str, Any], suffix: str
+) -> None:
+    """Walk an op (top-level or nested inside operation_sequence) and set
+    ``container_name_suffix`` on any script_bundle_run/script_bundle_exec whose
+    referenced container has ``docker.ephemeral=true``.
+
+    This fixes the class of failure where qc_op, probes, and evaluations all point
+    at the same one-shot QC container_id: a fixed docker ``--name`` collides between
+    back-to-back --rm runs when the previous cleanup hasn't finished (observed:
+    qc_op steps silently skipped, probes 100% failed with docker_run_failed). The
+    suffix makes each invocation's ``--name`` unique so the race is structurally
+    impossible.
+
+    Non-ephemeral containers (persistent training containers) are left alone —
+    they must keep their base name for teardown-by-name to work."""
+    if not isinstance(op_or_request, dict):
+        return
+    request = op_or_request.get("request") if "request" in op_or_request else op_or_request
+    if not isinstance(request, dict):
+        return
+    adapter = request.get("adapter")
+    if adapter == "operation_sequence":
+        for inner in request.get("steps") or []:
+            _apply_ephemeral_suffix(project_root, inner, suffix)
+        return
+    if adapter not in ("script_bundle_run", "script_bundle_exec"):
+        return
+    cid = request.get("container_id")
+    if not cid:
+        return
+    try:
+        container = load_container_record(project_root, str(cid))
+    except OperationError:
+        return
+    if bool((container.get("docker") or {}).get("ephemeral")):
+        request["container_name_suffix"] = suffix
 
 
 def _validate_qc_template(template: dict[str, Any]) -> None:
@@ -640,6 +681,8 @@ def build_evaluation_op(
     }
     rendered = _substitute(template, mapping)
     run_id = str(managed_run.get("run_id", ""))
+    eval_id = str(evaluation.get("eval_id", "eval"))
+    _apply_ephemeral_suffix(project_root, rendered, f"step{step:06d}__eval_{eval_id}")
     return _prepend_run_label(rendered, run_id) if run_id else rendered
 
 

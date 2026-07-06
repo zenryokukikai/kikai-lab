@@ -22,6 +22,10 @@
           "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
           "type": "string"
         },
+        "ephemeral": {
+          "description": "This container definition is REUSED by many short ops (QC/probes/evals) in rapid succession. When true, the reconciler appends a per-invocation suffix to docker.name so back-to-back --rm runs don't collide on the docker name (a stale --rm cleanup racing a new --name request is the failure mode). Default false = legacy single-persistent behaviour (training containers, one name for the run's lifetime).",
+          "type": "boolean"
+        },
         "network_mode": {
           "type": "string"
         },

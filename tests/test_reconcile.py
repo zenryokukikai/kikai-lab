@@ -10,7 +10,8 @@ from kikai_lab.operation import OperationError
 # --------------------------------------------------------------------------- #
 # fixtures / fakes
 # --------------------------------------------------------------------------- #
-def make_registry(tmp_path, container_id="run_training", docker_name="train-ctr"):
+def make_registry(tmp_path, container_id="run_training", docker_name="train-ctr",
+                   ephemeral_qc_container=False):
     project_root = tmp_path / "registry"
     containers = project_root / "containers"
     containers.mkdir(parents=True, exist_ok=True)
@@ -21,6 +22,17 @@ def make_registry(tmp_path, container_id="run_training", docker_name="train-ctr"
         "docker:\n"
         f"  name: {docker_name}\n"
         "  image: example:latest\n"
+    )
+    # register a distinct QC-runner container; ephemeral flag controls whether
+    # the reconciler injects a per-invocation container_name_suffix on it.
+    (containers / "qc_runner.yaml").write_text(
+        "schema_version: 1\n"
+        "kind: docker_container\n"
+        "container_id: qc_runner\n"
+        "docker:\n"
+        "  name: qc-runner\n"
+        "  image: qc:latest\n"
+        + ("  ephemeral: true\n" if ephemeral_qc_container else "")
     )
     return project_root
 
@@ -367,6 +379,51 @@ def test_one_probe_failure_isolated_from_others_and_qc(tmp_path):
     assert prog["probes_done_steps"].get("good_probe") == [1000]
     assert prog["probes_done_steps"].get("bad_probe") in (None, [])
     assert any(e["probe_id"] == "bad_probe" for e in s["probe_errors"])
+
+
+def test_qc_op_gets_ephemeral_suffix_when_container_is_ephemeral(tmp_path):
+    """The rapid-succession --name collision (observed: qc_op steps silently silently
+    skipped when qc_op and probes both hit `container_id=qc_runner` back-to-back) is
+    prevented by ephemeral=true → the reconciler stamps a per-invocation suffix onto
+    the request so docker_run_command generates a unique --name."""
+    project_root = make_registry(tmp_path, ephemeral_qc_container=True)
+    run_dir = make_run_dir(tmp_path, ["checkpoint_step_001000_loss0p5.pt"])
+    mr = managed_run(run_dir)
+    ex = FakeExec()
+    reconcile.tick(project_root, mr, reconcile.default_progress("r"),
+                   execute=ex, inspect=fake_inspect(running=True))
+    qc = ex.qc_calls()[0]
+    assert qc.get("container_name_suffix") == "step001000", qc
+
+
+def test_qc_op_no_suffix_when_container_is_not_ephemeral(tmp_path):
+    """Persistent training containers keep their fixed docker name for teardown; no
+    suffix is emitted."""
+    project_root = make_registry(tmp_path, ephemeral_qc_container=False)
+    run_dir = make_run_dir(tmp_path, ["checkpoint_step_001000_loss0p5.pt"])
+    mr = managed_run(run_dir)
+    ex = FakeExec()
+    reconcile.tick(project_root, mr, reconcile.default_progress("r"),
+                   execute=ex, inspect=fake_inspect(running=True))
+    qc = ex.qc_calls()[0]
+    assert "container_name_suffix" not in qc
+
+
+def test_probes_get_unique_ephemeral_suffix_distinct_from_qc(tmp_path):
+    """Probes and qc_op running against the SAME ephemeral container in the same
+    tick must receive distinct suffixes so their --name values don't collide with
+    each other (the exact class of failure)."""
+    project_root = make_registry(tmp_path, ephemeral_qc_container=True)
+    run_dir = make_run_dir(tmp_path, ["checkpoint_step_001000_loss0p5.pt"])
+    mr = managed_run(run_dir, probes=[_probe("heldout")])
+    ex = FakeExec()
+    reconcile.tick(project_root, mr, reconcile.default_progress("r"),
+                   execute=ex, inspect=fake_inspect(running=True))
+    qc = [c for c in ex.qc_calls() if c.get("bundle_id") == "diag_bundle"][0]
+    probe = [c for c in ex.qc_calls() if c.get("bundle_id") == "probe_bundle"][0]
+    assert qc.get("container_name_suffix") == "step001000"
+    assert probe.get("container_name_suffix") == "step001000__probe_heldout"
+    assert qc["container_name_suffix"] != probe["container_name_suffix"]
 
 
 def test_probe_op_prepended_with_run_label(tmp_path):
@@ -1026,6 +1083,70 @@ def test_clean_tick_clears_stale_last_error(tmp_path):
     summary = r.tick(project, managed, progress, execute=fake_execute, inspect=fake_inspect)
     assert summary["qc_errors"] == []
     assert progress["last_error"] is None
+
+
+def test_docker_run_composes_ephemeral_suffix_into_name(tmp_path, monkeypatch):
+    """docker_run_command must compose --name = docker.name + '__' + suffix when
+    the container is ephemeral and the request carries container_name_suffix."""
+    from kikai_lab import operation as op
+
+    (tmp_path / "containers").mkdir()
+    (tmp_path / "containers" / "qc.yaml").write_text(
+        "schema_version: 1\nkind: docker_container\ncontainer_id: qc\n"
+        "docker:\n  name: qc-runner\n  image: img\n  ephemeral: true\n",
+        encoding="utf-8",
+    )
+    container = op.load_container_record(tmp_path, "qc")
+    cmd = op.docker_run_command(
+        request={"container_id": "qc", "container_name_suffix": "step001000__probe_heldout"},
+        container=container, container_id="qc", project_root=tmp_path, argv=["/bin/true"],
+    )
+    assert "--name" in cmd
+    name = cmd[cmd.index("--name") + 1]
+    assert name == "qc-runner__step001000__probe_heldout", name
+
+
+def test_docker_run_rejects_suffix_on_non_ephemeral_container(tmp_path, monkeypatch):
+    """A non-ephemeral container carries a persistent name used for teardown; a
+    silent suffix rewrite would orphan the persistent name. Refuse loudly."""
+    from kikai_lab import operation as op
+
+    (tmp_path / "containers").mkdir()
+    (tmp_path / "containers" / "tr.yaml").write_text(
+        "schema_version: 1\nkind: docker_container\ncontainer_id: tr\n"
+        "docker:\n  name: train-ctr\n  image: img\n",   # no ephemeral flag
+        encoding="utf-8",
+    )
+    container = op.load_container_record(tmp_path, "tr")
+    import pytest
+    with pytest.raises(op.OperationError) as excinfo:
+        op.docker_run_command(
+            request={"container_id": "tr", "container_name_suffix": "step001000"},
+            container=container, container_id="tr", project_root=tmp_path, argv=["/bin/true"],
+        )
+    assert excinfo.value.code == "operation.container_name_suffix_not_ephemeral"
+
+
+def test_docker_run_composed_name_within_docker_63char_limit(tmp_path):
+    """Docker enforces a 63-char --name limit; the compose logic must truncate
+    the base if a long suffix would overflow."""
+    from kikai_lab import operation as op
+
+    (tmp_path / "containers").mkdir()
+    long_base = "a" * 40                                         # 40 chars
+    (tmp_path / "containers" / "qc.yaml").write_text(
+        "schema_version: 1\nkind: docker_container\ncontainer_id: qc\n"
+        f"docker:\n  name: {long_base}\n  image: img\n  ephemeral: true\n",
+        encoding="utf-8",
+    )
+    container = op.load_container_record(tmp_path, "qc")
+    long_suffix = "step999999__probe_a_very_long_probe_identifier_that_could_overflow"
+    cmd = op.docker_run_command(
+        request={"container_id": "qc", "container_name_suffix": long_suffix},
+        container=container, container_id="qc", project_root=tmp_path, argv=["/bin/true"],
+    )
+    name = cmd[cmd.index("--name") + 1]
+    assert len(name) <= 63, f"name too long ({len(name)}): {name}"
 
 
 def test_foreground_docker_run_clears_exited_leftover(tmp_path, monkeypatch):
