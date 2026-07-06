@@ -1707,6 +1707,38 @@ def docker_run_mount_args(project_root: Path, container: dict[str, Any]) -> list
     return command
 
 
+def _composed_docker_name(
+    container: dict[str, Any], container_id: str, request: dict[str, Any]
+) -> str | None:
+    """Compose the exact --name docker run will use, respecting container ephemeral
+    flag and request.container_name_suffix. Used by BOTH docker_run_command (to set
+    --name) and execute_docker_run_operation's preflight (to inspect the SAME name
+    the run will pass). Any drift between the two would either false-flag legitimate
+    concurrent invocations as name collisions, or miss real leftovers."""
+    docker_meta = container.get("docker")
+    declared_name = docker_meta.get("name") if isinstance(docker_meta, dict) else None
+    if not (isinstance(declared_name, str) and declared_name):
+        return None
+    ephemeral = bool(isinstance(docker_meta, dict) and docker_meta.get("ephemeral"))
+    suffix = request.get("container_name_suffix") if isinstance(request, dict) else None
+    if isinstance(suffix, str) and suffix and not ephemeral:
+        raise OperationError(
+            "operation.container_name_suffix_not_ephemeral",
+            "container_name_suffix requires container.docker.ephemeral=true",
+            {"container_id": container_id, "suffix": suffix},
+        )
+    resolved_name = resolve_text_ref(declared_name)
+    if ephemeral and isinstance(suffix, str) and suffix:
+        # Per-invocation uniqueness: mangle non-safe chars, length-bound the suffix
+        # so the composed name always stays under docker's 63-char --name limit
+        # and matches _SAFE_CONTAINER_NAME.
+        safe_suffix = re.sub(r"[^A-Za-z0-9_.-]", "_", suffix)[:50]
+        max_base = 63 - len(safe_suffix) - 2   # 2 for "__"
+        base = resolved_name[: max(1, max_base)]
+        resolved_name = f"{base}__{safe_suffix}"
+    return resolved_name
+
+
 def docker_run_command(
     *,
     request: dict[str, Any],
@@ -1720,32 +1752,9 @@ def docker_run_command(
     # definition declares docker.name, so a run can be torn down by name on stop
     # (one-run-one-named-container). Without this, `docker run --rm` is anonymous
     # and teardown-by-name silently matches nothing, orphaning the GPU.
-    docker_meta = container.get("docker")
-    declared_name = docker_meta.get("name") if isinstance(docker_meta, dict) else None
-    ephemeral = bool(isinstance(docker_meta, dict) and docker_meta.get("ephemeral"))
-    suffix = request.get("container_name_suffix")
-    if isinstance(suffix, str) and suffix and not ephemeral:
-        # Suffixing a NON-ephemeral container would silently orphan its persistent
-        # name — refuse loudly instead. Persistent training containers use the
-        # base name for teardown/inspect; suffixing them breaks stop-by-name.
-        raise OperationError(
-            "operation.container_name_suffix_not_ephemeral",
-            "container_name_suffix requires container.docker.ephemeral=true",
-            {"container_id": container_id, "suffix": suffix},
-        )
-    if isinstance(declared_name, str) and declared_name:
-        resolved_name = resolve_text_ref(declared_name)
-        if ephemeral and isinstance(suffix, str) and suffix:
-            # Per-invocation uniqueness for ephemeral containers: mangling and
-            # length-bound the suffix so the composed --name always stays under
-            # docker's 63-char limit and matches _SAFE_CONTAINER_NAME.
-            safe_suffix = re.sub(r"[^A-Za-z0-9_.-]", "_", suffix)[:50]
-            # keep total <=63 chars (docker limit); truncate base if forced
-            max_base = 63 - len(safe_suffix) - 2   # 2 for "__"
-            base = resolved_name[:max(1, max_base)]
-            resolved_name = f"{base}__{safe_suffix}"
-        if _SAFE_CONTAINER_NAME.match(resolved_name):
-            command.extend(["--name", resolved_name])
+    resolved_name = _composed_docker_name(container, container_id, request)
+    if resolved_name and _SAFE_CONTAINER_NAME.match(resolved_name):
+        command.extend(["--name", resolved_name])
     gpus = container.get("gpus")
     if isinstance(gpus, str) and gpus:
         command.extend(["--gpus", resolve_text_ref(gpus)])
@@ -2101,7 +2110,11 @@ def execute_docker_run_operation(request: dict[str, Any]) -> dict[str, Any]:
     # every later run of the profile. Clear NON-running leftovers; a RUNNING holder is
     # a real conflict and gets a precise, actionable error instead of docker's stderr.
     try:
-        preflight_name = resolve_text_ref(docker_name_from_container(container, container_id))
+        # Preflight the EXACT name docker_run_command will pass, including the
+        # ephemeral suffix when applicable — checking the base name would flag
+        # a legitimately-different-suffix concurrent invocation as a collision
+        # (defeating the whole point of ephemeral naming).
+        preflight_name = _composed_docker_name(container, container_id, request)
         # Preflight exactly and only the name the run will pass: docker_run_command
         # adds --name only for _SAFE_CONTAINER_NAME matches, and `docker rm` accepts
         # ids/prefixes, so an unsafe declared name must never reach rm.
