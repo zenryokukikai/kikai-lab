@@ -40,7 +40,8 @@ def write_fake_docker(tmp_path: Path):
         "    if not control.get('exists'):\n"
         "        sys.stderr.write('Error: No such object')\n"
         "        raise SystemExit(1)\n"
-        "    print(json.dumps([{'State': {'Running': True, 'Status': 'running'}}]))\n"
+        "    status = control.get('status', 'running')\n"
+        "    print(json.dumps([{'State': {'Running': status == 'running', 'Status': status}}]))\n"
         "    raise SystemExit(0)\n"
         "if cmd == 'rm':\n"
         "    control['exists'] = False\n"
@@ -425,6 +426,25 @@ def test_submit_crash_window_is_adoptable(tmp_path: Path, monkeypatch) -> None:
     assert record["status"] == "running"
     # adoption never issued a second docker run
     assert [a for a in read_argv() if a and a[0] == "run"] == []
+
+
+def test_detached_run_clears_exited_holder_and_starts(tmp_path: Path, monkeypatch) -> None:
+    """A terminally-stopped (exited) same-name container is dead weight: the detached
+    path must rm it and start, mirroring the foreground preflight — instead of wedging
+    every rerun behind a manual teardown (2026-07-08 srprobe incident)."""
+    client = make_client(tmp_path)
+    prepare_project(tmp_path, client)
+    fake, read_argv, set_control = write_fake_docker(tmp_path)
+    monkeypatch.setenv("KIKAI_DOCKER_BIN", str(fake))
+    set_container_env(monkeypatch, tmp_path)
+    set_control(exists=True, status="exited")  # leftover from a previous one-shot
+
+    response = submit(client)
+    assert response.status_code == 201, response.text
+    argv = read_argv()
+    # the exited holder was force-removed, then the run started
+    assert any(a and a[0] == "rm" for a in argv)
+    assert any(a and a[0] == "run" for a in argv)
 
 
 def test_fresh_submit_name_collision_points_at_stop(tmp_path: Path, monkeypatch) -> None:

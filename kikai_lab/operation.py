@@ -2201,34 +2201,43 @@ def execute_docker_run_detached_operation(request: dict[str, Any]) -> dict[str, 
         )
     )
     container = load_container_record(project_root, container_id)
-    docker_meta = container.get("docker")
-    declared_name = docker_meta.get("name") if isinstance(docker_meta, dict) else None
-    if not isinstance(declared_name, str) or not declared_name:
+    # Compose the SAME name docker run will pass — honoring the container's ephemeral
+    # flag and request.container_name_suffix, exactly like the foreground path. The
+    # detached path previously read docker.name raw, so suffixed concurrent ops
+    # collided and every rerun tripped over its own exited predecessor (2026-07-08).
+    container_name = _composed_docker_name(container, container_id, request)
+    if container_name is None:
         raise OperationError(
             "operation.script_bundle_run_detach_requires_name",
             "detached script_bundle_run requires the container to define docker.name",
             {"container_id": container_id},
         )
-    container_name = resolve_text_ref(declared_name)
     if not _SAFE_CONTAINER_NAME.match(container_name):
         raise OperationError(
             "operation.script_bundle_run_detach_requires_name",
             "detached script_bundle_run docker.name is not a safe container name",
             {"container_id": container_id, "container_name": container_name},
         )
-    # Idempotency/safety: refuse to start when a same-named container already exists
-    # (running OR exited). The caller must teardown first so we never silently clobber
-    # a live run or reuse a stale name.
-    inspect_found, _inspect_data, _inspect_stderr = docker_inspect_by_name(
+    # Idempotency/safety, mirroring the foreground preflight: a terminally-stopped
+    # (exited/dead) holder of this exact name is dead weight — remove it so detached
+    # reruns are self-healing. A RUNNING/creating holder is a real conflict: refuse,
+    # never clobber.
+    inspect_found, inspect_data, _inspect_stderr = docker_inspect_by_name(
         request, container_name
     )
     if inspect_found:
-        raise OperationError(
-            "operation.script_bundle_run_name_in_use",
-            "a container with this name already exists; teardown first "
-            "(remote_docker_teardown) before starting a detached run",
-            {"container_id": container_id, "container_name": container_name},
-        )
+        state = inspect_data[0].get("State") if inspect_data and isinstance(inspect_data[0], dict) else None
+        state = state if isinstance(state, dict) else {}
+        status = state.get("Status")
+        if status in ("exited", "dead"):
+            docker_rm_force(request, container_name)
+        else:
+            raise OperationError(
+                "operation.script_bundle_run_name_in_use",
+                f"a container already holds this name (status: {status}); teardown first "
+                "(remote_docker_teardown) before starting a detached run",
+                {"container_id": container_id, "container_name": container_name},
+            )
     command = docker_detached_run_command(
         request=request,
         container=container,
