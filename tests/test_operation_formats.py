@@ -88,3 +88,88 @@ def test_cli_target_dry_run_accepts_yaml_op(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     reloaded = load_operation(p)
     assert reloaded.get("guard_receipt", {}).get("status") == "passed"
+
+
+def test_foreground_docker_run_timeout_raises_and_frees_name(tmp_path, monkeypatch):
+    """A hung foreground op must NOT hang the caller (= the reconcile daemon)
+    forever: subprocess timeout -> operation.docker_run_timeout (2026-07-08)."""
+    import subprocess as _subprocess
+
+    from kikai_lab import operation as op_mod
+    from kikai_lab.operation import OperationError, execute_docker_run_operation
+
+    calls = {"rm": 0}
+
+    def fake_run(command, **kwargs):
+        if command[1:2] == ["rm"]:
+            calls["rm"] += 1
+            return _subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        if command[1:2] == ["inspect"]:
+            raise OperationError("operation.docker_inspect_failed", "not found", {})
+        raise _subprocess.TimeoutExpired(cmd=command, timeout=1, output=b"partial")
+
+    monkeypatch.setattr(op_mod.subprocess, "run", fake_run)
+    monkeypatch.setenv("KIKAI_OP_TIMEOUT_SEC", "1")
+
+    project_root = tmp_path / "proj"
+    (project_root / "containers").mkdir(parents=True)
+    (project_root / "containers" / "c.yaml").write_text(
+        "schema_version: 1\nkind: docker_container\ncontainer_id: c\n"
+        "docker:\n  name: c-name\n  image: img:latest\n"
+    )
+    request = {
+        "adapter": "docker_run",
+        "operation": "t",
+        "container_id": "c",
+        "project_root": str(project_root),
+        "argv": ["python3", "x.py"],
+    }
+    try:
+        execute_docker_run_operation(request)
+        raise AssertionError("expected operation.docker_run_timeout")
+    except OperationError as exc:
+        assert exc.code == "operation.docker_run_timeout"
+        # TimeoutExpired carries UNDECODED bytes on POSIX even under text=True —
+        # the tail must decode them, not silently drop them.
+        assert exc.details["stdout_tail"] == "partial"
+    # expiry force-removed the held name so the next attempt is not wedged
+    assert calls["rm"] == 1
+
+
+def test_timeout_zero_disables_and_invalid_rejected(tmp_path, monkeypatch):
+    import subprocess as _subprocess
+
+    from kikai_lab import operation as op_mod
+    from kikai_lab.operation import OperationError, execute_docker_run_operation
+
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        if command[1:2] == ["inspect"]:
+            raise OperationError("operation.docker_inspect_failed", "not found", {})
+        seen["timeout"] = kwargs.get("timeout", "MISSING")
+        return _subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(op_mod.subprocess, "run", fake_run)
+    project_root = tmp_path / "proj"
+    (project_root / "containers").mkdir(parents=True)
+    (project_root / "containers" / "c.yaml").write_text(
+        "schema_version: 1\nkind: docker_container\ncontainer_id: c\n"
+        "docker:\n  name: c-name\n  image: img:latest\n"
+    )
+    base = {
+        "adapter": "docker_run", "operation": "t", "container_id": "c",
+        "project_root": str(project_root), "argv": ["python3", "x.py"],
+    }
+    # timeout_sec: 0 = EXPLICITLY unbounded
+    execute_docker_run_operation({**base, "timeout_sec": 0})
+    assert seen["timeout"] is None
+    # absent -> 1800 default
+    execute_docker_run_operation(dict(base))
+    assert seen["timeout"] == 1800
+    # invalid -> loud error like every other request field
+    try:
+        execute_docker_run_operation({**base, "timeout_sec": "45m"})
+        raise AssertionError("expected operation.timeout_sec_invalid")
+    except OperationError as exc:
+        assert exc.code == "operation.timeout_sec_invalid"

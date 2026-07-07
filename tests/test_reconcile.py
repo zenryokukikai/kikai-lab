@@ -1851,3 +1851,110 @@ def test_metric_checks_relative_windows(tmp_path):
     assert rows["abs_pending"]["verdict"] in ("no_data", "invalid_check", "fail")
     # relative without explicit window is rejected, not eternally pending
     assert rows["rel_no_window"]["verdict"] == "invalid_check"
+
+
+# --------------------------------------------------------------------------- #
+# serve heartbeat (_serve_state.json): externally visible daemon state
+# --------------------------------------------------------------------------- #
+def test_reconcile_once_writes_serve_heartbeat(tmp_path):
+    """The daemon must be diagnosable through the API alone: reconcile_once stamps
+    which run it is entering BEFORE the tick and an idle summary after the pass
+    (2026-07-08 freeze was undiagnosable without host access)."""
+    import yaml as _yaml
+
+    project_root = make_registry(tmp_path)
+    run_dir = make_run_dir(tmp_path, ["checkpoint_step_001000_loss0p5.pt"])
+    mr = managed_run(run_dir)
+    mr_dir = project_root / "managed_runs"
+    mr_dir.mkdir(parents=True, exist_ok=True)
+    (mr_dir / "r.yaml").write_text(_yaml.safe_dump(mr))
+
+    # one-shot pass (default): must NOT stamp the heartbeat — a manual
+    # `kikai reconcile` would otherwise overwrite a wedged daemon's phase=tick
+    reconcile.reconcile_once(
+        project_root, execute=FakeExec(), inspect=fake_inspect(running=True)
+    )
+    assert reconcile.load_serve_state(project_root) == {}
+
+    result = reconcile.reconcile_once(
+        project_root, execute=FakeExec(), inspect=fake_inspect(running=True),
+        write_heartbeat=True,
+    )
+    assert result["managed_runs"] == 1
+
+    state = reconcile.load_serve_state(project_root)
+    assert state.get("phase") == "idle"
+    assert state.get("updated_at")
+    assert state.get("writer_pid")
+    assert state["last_pass"]["managed_runs"] == 1
+    assert state["last_pass"]["errors"] == []
+
+
+def test_serve_heartbeat_surfaces_probe_errors(tmp_path):
+    import yaml as _yaml
+
+    project_root = make_registry(tmp_path)
+    run_dir = make_run_dir(tmp_path, ["checkpoint_step_001000_loss0p5.pt"])
+    mr = managed_run(run_dir)
+    mr["probes"] = [{
+        "id": "p1", "bundle_id": "b", "container_id": "qc_runner",
+        "entrypoint": "e", "project_root": str(project_root), "args": [],
+    }]
+    del mr["qc_op"]  # probe-only run
+    mr_dir = project_root / "managed_runs"
+    mr_dir.mkdir(parents=True, exist_ok=True)
+    (mr_dir / "r.yaml").write_text(_yaml.safe_dump(mr))
+
+    reconcile.reconcile_once(
+        project_root,
+        execute=FakeExec(fail_adapters=("script_bundle_run",)),
+        inspect=fake_inspect(running=True),
+        write_heartbeat=True,
+    )
+    state = reconcile.load_serve_state(project_root)
+    assert state["phase"] == "idle"
+    assert "r" in state["last_pass"]["probe_errors"]
+    # the failure was ALSO persisted to the run's progress immediately
+    progress = reconcile.load_progress(project_root, "r")
+    assert "probe p1@1000" in str(progress.get("last_error"))
+
+
+def test_repeated_op_failure_gives_up_after_cap(tmp_path):
+    """A deterministically failing (e.g. always-timing-out) qc/probe op must not be
+    relaunched forever — after MAX_OP_FAILURES the step is skipped and the give-up
+    is recorded, so one broken op cannot starve every other run's reconciliation."""
+    project_root = make_registry(tmp_path)
+    run_dir = make_run_dir(tmp_path, ["checkpoint_step_001000_loss0p5.pt"])
+    mr = managed_run(run_dir)
+
+    progress = reconcile.default_progress("r")
+    for _ in range(reconcile.MAX_OP_FAILURES):
+        ex = FakeExec(fail_adapters=("script_bundle_run",))
+        reconcile.tick(project_root, mr, progress, execute=ex, inspect=fake_inspect(running=True))
+        assert len(ex.qc_calls()) == 1  # still retrying
+        progress = reconcile.load_progress(project_root, "r")
+
+    assert progress["op_fail_counts"]["qc:1000"] == reconcile.MAX_OP_FAILURES
+    ex_final = FakeExec(fail_adapters=("script_bundle_run",))
+    reconcile.tick(project_root, mr, progress, execute=ex_final, inspect=fake_inspect(running=True))
+    assert ex_final.qc_calls() == []  # gave up: no relaunch
+    progress = reconcile.load_progress(project_root, "r")
+    assert "qc:1000" in progress["op_gave_up"]
+    assert "gave up" in progress["last_error"]
+
+
+def test_probe_timeout_sec_passthrough(tmp_path):
+    project_root = make_registry(tmp_path)
+    run_dir = make_run_dir(tmp_path, ["checkpoint_step_001000_loss0p5.pt"])
+    mr = managed_run(run_dir)
+    mr["probes"] = [{
+        "id": "slow", "bundle_id": "b", "container_id": "qc_runner",
+        "entrypoint": "e", "project_root": str(project_root), "args": [],
+        "timeout_sec": 0,
+    }]
+    del mr["qc_op"]
+    ex = FakeExec()
+    reconcile.tick(project_root, mr, reconcile.default_progress("r"),
+                   execute=ex, inspect=fake_inspect(running=True))
+    probe_reqs = [c for c in ex.calls if c.get("adapter") == "script_bundle_run"]
+    assert probe_reqs and probe_reqs[0]["timeout_sec"] == 0

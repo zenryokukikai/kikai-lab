@@ -149,11 +149,15 @@
           },
           "args": {
             "description": "Command-line args passed to the entrypoint. Supports {{step}}/{{step6}}/{{checkpoint_name}}/{{run_id}} substitution.",
-            "items": {"type": "string"},
+            "items": {
+              "type": "string"
+            },
             "type": "array"
           },
           "env": {
-            "additionalProperties": {"type": "string"},
+            "additionalProperties": {
+              "type": "string"
+            },
             "description": "Env vars for the probe container. Use 'env:VAR' to inject a daemon env at execution time.",
             "type": "object"
           },
@@ -165,6 +169,11 @@
           "operation": {
             "description": "Operation id template stored in the ops ledger. Defaults to '{run_id}_{probe_id}_step{{step6}}'. MUST vary with step.",
             "type": "string"
+          },
+          "timeout_sec": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Wall-clock budget (seconds) for this probe's foreground docker run. 0 = explicitly unbounded. Absent -> KIKAI_OP_TIMEOUT_SEC env or the 1800s default. Without this a legitimately-long probe would be killed and retried forever."
           }
         },
         "required": [

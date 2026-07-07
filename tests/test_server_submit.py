@@ -300,8 +300,9 @@ def test_background_reconciler_pass_and_healthz(tmp_path: Path) -> None:
 
     seen: list[str] = []
 
-    def fake_once(project_path):
+    def fake_once(project_path, *, write_heartbeat=False):
         seen.append(Path(project_path).name)
+        assert write_heartbeat is True  # long-running reconciler owns the heartbeat
         return {"managed_runs": 0, "results": []}
 
     config = ServerConfig(

@@ -508,3 +508,26 @@ def test_bearer_auth_gate(tmp_path: Path) -> None:
     # no token configured -> open (backward compatible)
     open_client = TestClient(create_app(ServerConfig(projects_root=tmp_path)))
     assert open_client.get("/v1/projects").status_code == 200
+
+
+def test_daemon_endpoint_returns_heartbeat(tmp_path: Path) -> None:
+    """GET /projects/{id}/daemon surfaces the reconcile heartbeat so daemon
+    wedges/backlogs are diagnosable without host access (2026-07-08)."""
+    client = make_client(tmp_path)
+    client.put("/v1/projects/example_new", json={"title": "Example"})
+
+    # no heartbeat yet -> empty state + hint
+    r = client.get("/v1/projects/example_new/daemon")
+    assert r.status_code == 200
+    assert r.json()["data"]["state"] == {}
+
+    from kikai_lab.reconcile import write_serve_state
+
+    write_serve_state(tmp_path / "example_new", {
+        "phase": "tick", "current_run_id": "run_x", "tick_started_at": 123.0,
+    })
+    r2 = client.get("/v1/projects/example_new/daemon")
+    data = r2.json()["data"]
+    assert data["state"]["phase"] == "tick"
+    assert data["state"]["current_run_id"] == "run_x"
+    assert "seconds_since_update" in data

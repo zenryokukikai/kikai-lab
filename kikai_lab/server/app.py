@@ -30,6 +30,7 @@ _NOT_FOUND_TAILS = ("missing", "not_found")
 _CONFLICT_TAILS = ("exists", "in_use", "archived", "not_local")
 _FORBIDDEN_TAILS = ("forbidden",)
 _UNPROCESSABLE_TAILS = ("invalid", "unknown", "unverified", "incompatible")
+_TIMEOUT_TAILS = ("timeout",)
 
 
 def _tail_matches(tail: str, names: tuple[str, ...]) -> bool:
@@ -46,6 +47,11 @@ def http_status_for_code(code: str) -> int:
         return 403
     if _tail_matches(tail, _UNPROCESSABLE_TAILS):
         return 422
+    if _tail_matches(tail, _TIMEOUT_TAILS):
+        # an infrastructure budget exceeded (docker_run_timeout / docker_exec_timeout)
+        # is gateway-timeout semantics — 400 would tell clients "your request is
+        # malformed, do not retry", the opposite of the truth.
+        return 504
     return 400
 
 

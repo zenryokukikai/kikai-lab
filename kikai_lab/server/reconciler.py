@@ -41,7 +41,8 @@ def reconcile_all(config: ServerConfig, *, once_fn: Callable = reconcile_once) -
     results: dict[str, Any] = {}
     for project_path in active_project_paths(config):
         try:
-            results[project_path.name] = once_fn(project_path)
+            # long-running reconciler -> owns the heartbeat (one-shot CLI does not)
+            results[project_path.name] = once_fn(project_path, write_heartbeat=True)
         except Exception as exc:  # one project never kills the pass
             logger.exception("reconcile pass failed for %s", project_path.name)
             results[project_path.name] = {"error": type(exc).__name__}

@@ -267,6 +267,34 @@ def build_projects_router(config: ServerConfig) -> APIRouter:
             data={"events": entries[-limit:], "total": len(entries)},
         )
 
+    @router.get("/projects/{project_id}/daemon")
+    def project_daemon(project_id: str) -> JSONResponse:
+        """The reconcile daemon's heartbeat (managed_runs/_serve_state.json): what it
+        is doing RIGHT NOW (phase, current run, pass start time, writer_pid) plus the
+        last completed pass's per-run error summary. Answers 'is the daemon alive,
+        wedged, or grinding a long QC backlog?' without host access — the 2026-07-08
+        freeze was undiagnosable through the API precisely because this did not exist.
+        Written ONLY by long-running reconcilers (external `kikai serve` or the
+        embedded BackgroundReconciler — the latter ALSO reports via /healthz;
+        one-shot `kikai reconcile` never stamps it)."""
+        import time as _time
+
+        from kikai_lab.reconcile import load_serve_state
+
+        path = require_project(config, project_id)
+        state = load_serve_state(path)
+        data: dict[str, Any] = {"state": state}
+        updated = state.get("updated_at")
+        if isinstance(updated, (int, float)):
+            data["seconds_since_update"] = max(0.0, _time.time() - float(updated))
+        data["hint"] = (
+            "no heartbeat yet (daemon never ran with heartbeat support, or not running)"
+            if not state else
+            "phase=tick + large seconds_since_update = the daemon is INSIDE that run's "
+            "tick (long QC backlog or a hung op); phase=idle = between passes"
+        )
+        return envelope_response(ok=True, data=data)
+
     @router.get("/projects/{project_id}/brief")
     def project_brief(project_id: str) -> JSONResponse:
         """The decision-relevant digest in ONE call: runs with verdicts and gate

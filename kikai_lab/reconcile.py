@@ -143,12 +143,87 @@ def load_progress(project_root: Path, run_id: str) -> dict[str, Any]:
     return merged
 
 
-def write_progress(project_root: Path, run_id: str, progress: dict[str, Any]) -> None:
-    path = progress_path(project_root, run_id)
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """tmp + os.replace with a PER-PROCESS tmp name: two writers racing a shared
+    fixed .tmp path could interleave write_text and publish a truncated file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(progress, indent=2, sort_keys=True), encoding="utf-8")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     os.replace(tmp, path)
+
+
+def write_progress(project_root: Path, run_id: str, progress: dict[str, Any]) -> None:
+    _atomic_write_json(progress_path(project_root, run_id), progress)
+
+
+MAX_OP_FAILURES = 3  # per qc/probe step: after this many failures the step is skipped
+                     # (a deterministic hang would otherwise burn its full timeout on
+                     # EVERY pass forever, starving every other run's reconciliation)
+
+
+def _persist_tick_error(
+    project_root: Path, run_id: str, progress: dict[str, Any], msg: str,
+    *, fail_key: str | None = None,
+) -> None:
+    """Persist a qc/probe failure IMMEDIATELY (not at tick end): a later op in the
+    same tick may block for its full timeout, and the on-disk progress (and the
+    /daemon endpoint) must already show this failure (2026-07-08). fail_key also
+    counts consecutive failures for the MAX_OP_FAILURES give-up gate."""
+    if fail_key is not None:
+        counts = progress.setdefault("op_fail_counts", {})
+        counts[fail_key] = int(counts.get(fail_key, 0)) + 1
+    progress["last_error"] = msg
+    write_progress(project_root, run_id, progress)
+
+
+def _gave_up(project_root: Path, run_id: str, progress: dict[str, Any], fail_key: str) -> bool:
+    """True when fail_key exhausted MAX_OP_FAILURES; records the give-up once."""
+    counts = progress.get("op_fail_counts") or {}
+    if int(counts.get(fail_key, 0)) < MAX_OP_FAILURES:
+        return False
+    gave = progress.setdefault("op_gave_up", [])
+    if fail_key not in gave:
+        gave.append(fail_key)
+        _persist_tick_error(
+            project_root, run_id, progress,
+            f"{fail_key}: gave up after {MAX_OP_FAILURES} failures (see op_fail_counts)",
+        )
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# serve heartbeat — externally visible daemon state (managed_runs/_serve_state.json)
+# --------------------------------------------------------------------------- #
+# WHY: a wedged/slow op used to freeze the daemon with NO externally visible
+# signal — progress files stop updating and the operator cannot tell "dead",
+# "wedged" and "grinding a long QC backlog" apart (2026-07-08 incident: one run's
+# first tick carried a large probe backlog; every other run's ticks froze and
+# the only diagnosis path left was host access, which is against the ops rules).
+# The daemon now stamps what it is doing BEFORE doing it, so `GET
+# /projects/{id}/daemon` can always answer "what is the daemon doing right now".
+def serve_state_path(project_root: Path) -> Path:
+    return managed_runs_dir(project_root) / "_serve_state.json"
+
+
+def write_serve_state(project_root: Path, state: dict[str, Any]) -> None:
+    try:
+        state = {**state, "updated_at": time.time(), "writer_pid": os.getpid()}
+        _atomic_write_json(serve_state_path(project_root), state)
+    except Exception:  # noqa: BLE001 — heartbeat must NEVER break reconciliation
+        # (not just OSError: e.g. a YAML-parsed non-string run_id would TypeError
+        # in json.dumps and would otherwise abort the whole pass before any tick)
+        logging.getLogger("kikai_lab.reconcile").exception("serve state write failed")
+
+
+def load_serve_state(project_root: Path) -> dict[str, Any]:
+    path = serve_state_path(project_root)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 # --------------------------------------------------------------------------- #
@@ -365,6 +440,10 @@ def build_probe_op(
     }
     if probe.get("env"):
         request["env"] = dict(probe["env"])
+    if probe.get("timeout_sec") is not None:
+        # per-probe wall-clock budget passthrough (0 = explicitly unbounded);
+        # without this a legitimately-long probe cannot escape the global default.
+        request["timeout_sec"] = probe["timeout_sec"]
     op = {"kind": "kikai_operation", "request": request, "schema_version": 1}
     mapping = {
         "step": str(step),
@@ -955,17 +1034,21 @@ def tick(
             continue
         if not qc_configured:
             continue
+        if _gave_up(project_root, run_id, progress, f"qc:{step}"):
+            continue
         try:
             qc_op = build_qc_op(project_root, managed_run, step, path)
         except OperationError as exc:
             summary["qc_errors"].append({"step": step, "error": exc.code})
             tick_had_error = True
-            progress["last_error"] = f"qc step {step}: {exc.code}"
+            _persist_tick_error(project_root, run_id, progress, f"qc step {step}: {exc.code}",
+                                fail_key=f"qc:{step}")
             continue
         except Exception as exc:  # bad/missing template file -> isolate, don't abort the tick
             summary["qc_errors"].append({"step": step, "error": "reconcile.qc_build_failed"})
             tick_had_error = True
-            progress["last_error"] = f"qc step {step}: build failed: {str(exc)[:160]}"
+            _persist_tick_error(project_root, run_id, progress, f"qc step {step}: build failed: {str(exc)[:160]}",
+                                fail_key=f"qc:{step}")
             continue
         # Drop a stale FAILED sequence record so the QC re-runs fresh (COMPLETED ones stay,
         # so a genuine replay still raises _record_exists -> idempotent success below).
@@ -985,14 +1068,16 @@ def tick(
             else:
                 summary["qc_errors"].append({"step": step, "error": exc.code})
                 tick_had_error = True
-                progress["last_error"] = f"qc step {step}: {exc.code}"
+                _persist_tick_error(project_root, run_id, progress,
+                                    f"qc step {step}: {exc.code}", fail_key=f"qc:{step}")
                 continue  # leave unmarked -> retried next tick
         except Exception as exc:  # adapter bug / unexpected -> isolate, keep the type visible
             summary["qc_errors"].append(
                 {"step": step, "error": f"reconcile.qc_exec_failed:{type(exc).__name__}"}
             )
             tick_had_error = True
-            progress["last_error"] = f"qc step {step}: exec failed: {str(exc)[:160]}"
+            _persist_tick_error(project_root, run_id, progress, f"qc step {step}: exec failed: {str(exc)[:160]}",
+                                fail_key=f"qc:{step}")
             continue
         done_steps.add(step)
         progress["qc_done_steps"] = sorted(done_steps)
@@ -1033,6 +1118,8 @@ def tick(
                 continue
             if every is not None and int(step) % int(every) != 0:
                 continue
+            if _gave_up(project_root, run_id, progress, f"probe:{probe_id}:{step}"):
+                continue
             try:
                 probe_op = build_probe_op(project_root, managed_run, probe, step, cpath)
             except OperationError as exc:
@@ -1040,7 +1127,8 @@ def tick(
                     {"probe_id": probe_id, "step": step, "error": exc.code}
                 )
                 tick_had_error = True
-                progress["last_error"] = f"probe {probe_id}@{step}: {exc.code}"
+                _persist_tick_error(project_root, run_id, progress, f"probe {probe_id}@{step}: {exc.code}",
+                                    fail_key=f"probe:{probe_id}:{step}")
                 continue
             _clear_incomplete_qc_record(project_root, probe_op)
             try:
@@ -1057,7 +1145,8 @@ def tick(
                         {"probe_id": probe_id, "step": step, "error": exc.code}
                     )
                     tick_had_error = True
-                    progress["last_error"] = f"probe {probe_id}@{step}: {exc.code}"
+                    _persist_tick_error(project_root, run_id, progress, f"probe {probe_id}@{step}: {exc.code}",
+                                        fail_key=f"probe:{probe_id}:{step}")
                     continue
             except Exception as exc:  # adapter bug — isolate to this probe
                 summary["probe_errors"].append(
@@ -1065,7 +1154,8 @@ def tick(
                      "error": f"reconcile.probe_exec_failed:{type(exc).__name__}"}
                 )
                 tick_had_error = True
-                progress["last_error"] = f"probe {probe_id}@{step}: {str(exc)[:120]}"
+                _persist_tick_error(project_root, run_id, progress, f"probe {probe_id}@{step}: {str(exc)[:120]}",
+                                    fail_key=f"probe:{probe_id}:{step}")
                 continue
             p_done.add(step)
             new_for_probe.append(step)
@@ -1353,7 +1443,13 @@ def tick(
         # A FULLY clean tick (qc, retention, finalize notify, teardown) clears the
         # sticky last_error so operators see current truth, not the ghost of a
         # long-fixed failure — and a still-failing teardown keeps its breadcrumb.
-        progress["last_error"] = None
+        # EXCEPT gave-up steps: permanently skipped QC is an ongoing abnormality,
+        # not a fixed one, and must stay visible until someone resets op_fail_counts.
+        gave = progress.get("op_gave_up") or []
+        progress["last_error"] = (
+            f"gave up on {len(gave)} op step(s): {', '.join(map(str, gave[:5]))}"
+            if gave else None
+        )
     summary["lifecycle_state"] = progress.get("lifecycle_state")
     write_progress(project_root, run_id, progress)
     return summary
@@ -1368,12 +1464,27 @@ def reconcile_once(
     *,
     execute: ExecuteFn | None = None,
     inspect: InspectFn | None = None,
+    write_heartbeat: bool = False,
 ) -> dict[str, Any]:
+    """write_heartbeat: ONLY long-running reconcilers (external `kikai serve`, the
+    embedded BackgroundReconciler) may stamp the daemon heartbeat. A one-shot
+    `kikai reconcile [--run-id X]` must NOT: its final idle stamp would overwrite
+    a wedged daemon's phase=tick state and mask the very incident the heartbeat
+    exists to expose."""
     project_root = Path(project_root)
+    pass_started = time.time()
     runs = load_managed_runs(project_root, run_id)
     results: list[dict[str, Any]] = []
     for managed_run in runs:
         current_run_id = managed_run.get("run_id")
+        # Stamp BEFORE the tick: if the tick wedges inside a long/hung op, the
+        # heartbeat still tells the operator exactly which run/op it entered.
+        if write_heartbeat:
+            write_serve_state(project_root, {
+                "phase": "tick",
+                "current_run_id": current_run_id,
+                "pass_started_at": pass_started,
+            })
         try:
             progress = load_progress(project_root, current_run_id)
             results.append(
@@ -1385,7 +1496,29 @@ def reconcile_once(
             results.append(
                 {"run_id": current_run_id, "error": "reconcile.tick_failed", "error_message": str(exc)}
             )
-    return {"managed_runs": len(runs), "results": results}
+    summary = {"managed_runs": len(runs), "results": results}
+    if not write_heartbeat:
+        return summary
+    write_serve_state(project_root, {
+        "phase": "idle",
+        "pass_started_at": pass_started,
+        "last_pass": {
+            "managed_runs": len(runs),
+            "errors": [
+                {"run_id": r.get("run_id"), "error": r.get("error")}
+                for r in results if r.get("error")
+            ],
+            "qc_errors": {
+                str(r.get("run_id")): r.get("qc_errors")
+                for r in results if r.get("qc_errors")
+            },
+            "probe_errors": {
+                str(r.get("run_id")): r.get("probe_errors")
+                for r in results if r.get("probe_errors")
+            },
+        },
+    })
+    return summary
 
 
 def serve(
@@ -1401,7 +1534,9 @@ def serve(
     """Reconcile every ``interval`` seconds until interrupted. ``once=True`` = a single pass."""
     interval = max(1, int(interval))  # never busy-loop on a 0/negative interval
     while True:
-        result = reconcile_once(project_root, run_id, execute=execute, inspect=inspect)
+        result = reconcile_once(
+            project_root, run_id, execute=execute, inspect=inspect, write_heartbeat=True
+        )
         if once:
             return result
         sleep(interval)

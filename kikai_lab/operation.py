@@ -1539,6 +1539,46 @@ def resolve_env_ref(value: str) -> str:
     return resolved
 
 
+def resolve_op_timeout_sec(request: dict[str, Any]) -> int | None:
+    """Wall-clock budget for a FOREGROUND op's subprocess (docker run / docker exec).
+
+    request.timeout_sec: positive int = cap; 0 = EXPLICITLY unbounded (the opt-out
+    for known-long foreground ops); invalid values fail loudly like every other
+    request field. Absent -> KIKAI_OP_TIMEOUT_SEC env (same semantics, lenient
+    parse) -> 1800s default. The default exists because one hung op used to freeze
+    the reconcile daemon forever (2026-07-08)."""
+    raw = request.get("timeout_sec")
+    if raw is not None:
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            raise OperationError(
+                "operation.timeout_sec_invalid",
+                "timeout_sec must be a non-negative integer (0 = unbounded)",
+                {"timeout_sec": raw},
+            )
+        return None if raw == 0 else raw
+    env_raw = os.environ.get("KIKAI_OP_TIMEOUT_SEC")
+    if env_raw:
+        try:
+            value = int(env_raw)
+        except ValueError:
+            return 1800
+        return None if value <= 0 else value
+    return 1800
+
+
+def _output_tail(value: Any, limit: int = 500) -> str:
+    """Last `limit` chars of a subprocess capture that may be str OR bytes.
+
+    subprocess.TimeoutExpired carries UNDECODED bytes even under text=True
+    (CPython populates it from the raw buffers on POSIX) — an isinstance(str)
+    guard would silently discard exactly the diagnostics a timeout needs."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")[-limit:]
+    if isinstance(value, str):
+        return value[-limit:]
+    return ""
+
+
 ENV_PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -1921,13 +1961,20 @@ def docker_logs_by_name(
 def docker_rm_force(request: dict[str, Any], container_name: str) -> None:
     command = [os.environ.get("KIKAI_DOCKER_BIN", "docker"), "rm", "-f", container_name]
     try:
+        # Bounded + best-effort: rm is hygiene, and it is invoked from failure
+        # handlers (e.g. the docker-run timeout path) whose most likely cause is a
+        # wedged docker daemon — the one scenario where an unbounded `docker rm -f`
+        # would re-freeze the very caller that is trying to escape a hang.
         subprocess.run(
             command,
             check=False,
             text=True,
             capture_output=True,
             env=docker_subprocess_env(request),
+            timeout=60,
         )
+    except subprocess.TimeoutExpired:
+        return
     except FileNotFoundError as exc:
         raise OperationError(
             "operation.docker_not_found",
@@ -2109,22 +2156,27 @@ def execute_docker_run_operation(request: dict[str, Any]) -> dict[str, Any]:
     # definition dead weight (e.g. an earlier detached ad-hoc op) and silently starves
     # every later run of the profile. Clear NON-running leftovers; a RUNNING holder is
     # a real conflict and gets a precise, actionable error instead of docker's stderr.
+    # Compose the EXACT name docker_run_command will pass, including the ephemeral
+    # suffix when applicable — checking the base name would flag a legitimately-
+    # different-suffix concurrent invocation as a collision. The composed name is
+    # kept OUTSIDE the inspect try so the timeout handler can still free it when
+    # the preflight inspect itself failed. Unsafe declared names never reach
+    # inspect/rm (docker rm accepts ids/prefixes).
     try:
-        # Preflight the EXACT name docker_run_command will pass, including the
-        # ephemeral suffix when applicable — checking the base name would flag
-        # a legitimately-different-suffix concurrent invocation as a collision
-        # (defeating the whole point of ephemeral naming).
-        preflight_name = _composed_docker_name(container, container_id, request)
-        # Preflight exactly and only the name the run will pass: docker_run_command
-        # adds --name only for _SAFE_CONTAINER_NAME matches, and `docker rm` accepts
-        # ids/prefixes, so an unsafe declared name must never reach rm.
-        if not _SAFE_CONTAINER_NAME.match(preflight_name):
-            raise OperationError("operation.preflight_skipped", "unsafe name", {})
-        found, data, _ = docker_inspect_by_name(
-            request, preflight_name, type_filter="container"
-        )
+        composed_name = _composed_docker_name(container, container_id, request)
     except OperationError:
-        found, data, preflight_name = False, [], None  # best-effort hygiene, never a gate
+        composed_name = None
+    if composed_name is not None and not _SAFE_CONTAINER_NAME.match(composed_name):
+        composed_name = None
+    preflight_name = composed_name
+    found, data = False, []
+    if preflight_name:
+        try:
+            found, data, _ = docker_inspect_by_name(
+                request, preflight_name, type_filter="container"
+            )
+        except OperationError:
+            found, data = False, []  # best-effort hygiene, never a gate
     if found:
         state = data[0].get("State") if data and isinstance(data[0], dict) else None
         state = state if isinstance(state, dict) else {}
@@ -2148,6 +2200,11 @@ def execute_docker_run_operation(request: dict[str, Any]) -> dict[str, Any]:
         project_root=project_root,
         argv=argv,
     )
+    # A foreground QC/probe op with NO timeout can hang forever (stuck GPU kernel,
+    # wedged container) and freeze the ENTIRE reconcile daemon — observed 2026-07-08
+    # (serve ticks frozen while one op never returned). See resolve_op_timeout_sec
+    # for the budget semantics (0 = explicit opt-out for known-long ops).
+    timeout_sec = resolve_op_timeout_sec(request)
     try:
         completed = subprocess.run(
             command,
@@ -2155,7 +2212,35 @@ def execute_docker_run_operation(request: dict[str, Any]) -> dict[str, Any]:
             text=True,
             capture_output=True,
             env=docker_subprocess_env(request),
+            timeout=timeout_sec,
         )
+    except subprocess.TimeoutExpired as exc:
+        details = {
+            "operation": request.get("operation"),
+            "container_id": container_id,
+            "timeout_sec": timeout_sec,
+            "stdout_tail": _output_tail(exc.stdout),
+            "stderr_tail": _output_tail(exc.stderr),
+        }
+        if preflight_name:
+            # free the held name (bounded + best-effort inside docker_rm_force)
+            # so a timed-out op never wedges its successors behind the name.
+            try:
+                docker_rm_force(request, preflight_name)
+            except OperationError:
+                pass
+        else:
+            # killing the CLI does not stop the workload; without a name there is
+            # no teardown handle — surface that instead of implying it is gone.
+            details["warning"] = (
+                "container has no declared docker.name; the docker client was "
+                "killed but the container may still be running"
+            )
+        raise OperationError(
+            "operation.docker_run_timeout",
+            f"docker run exceeded {timeout_sec}s and was killed",
+            details,
+        ) from exc
     except FileNotFoundError as exc:
         raise OperationError(
             "operation.docker_not_found",
@@ -2298,6 +2383,11 @@ def execute_docker_exec_operation(request: dict[str, Any]) -> dict[str, Any]:
     container = load_container_record(project_root, container_id)
     container_name = docker_name_from_container(container, container_id)
     command = [*docker_exec_prefix(request), container_name, *argv]
+    # Same hang protection as docker_run: a hung `docker exec` (stuck GPU kernel in
+    # the persistent container) froze the reconcile daemon just as effectively —
+    # QC templates legitimately use script_bundle_exec, so protecting only the run
+    # adapter would leave the 2026-07-08 failure mode reachable one adapter over.
+    timeout_sec = resolve_op_timeout_sec(request)
     try:
         completed = subprocess.run(
             command,
@@ -2305,7 +2395,22 @@ def execute_docker_exec_operation(request: dict[str, Any]) -> dict[str, Any]:
             text=True,
             capture_output=True,
             env=docker_subprocess_env(request),
+            timeout=timeout_sec,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise OperationError(
+            "operation.docker_exec_timeout",
+            f"docker exec exceeded {timeout_sec}s and the client was killed "
+            "(the exec'd process inside the container may still be running)",
+            {
+                "operation": request.get("operation"),
+                "container_id": container_id,
+                "container_name": container_name,
+                "timeout_sec": timeout_sec,
+                "stdout_tail": _output_tail(exc.stdout),
+                "stderr_tail": _output_tail(exc.stderr),
+            },
+        ) from exc
     except FileNotFoundError as exc:
         raise OperationError(
             "operation.docker_not_found",
