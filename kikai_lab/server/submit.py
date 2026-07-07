@@ -244,7 +244,9 @@ def _validate_qc_op_refs(path: Path, managed: dict[str, Any]) -> None:
         bundle_id = request.get("bundle_id")
         entrypoint = request.get("entrypoint")
         if bundle_id and entrypoint:
-            _validate_bundle_entrypoint_ref(path, str(bundle_id), str(entrypoint), where="managed.qc_op")
+            _validate_bundle_entrypoint_ref(
+                path, str(bundle_id), str(entrypoint), where="managed.qc_op"
+            )
 
 
 def validate_submission_pieces(
