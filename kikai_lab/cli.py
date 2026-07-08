@@ -265,6 +265,7 @@ def build_top_level_parser() -> argparse.ArgumentParser:
             "server",
             "tensorboard",
             "reconcile",
+            "remote",
             "serve",
             "target",
             "exec",
@@ -896,6 +897,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command in {"-h", "--help"}:
         build_top_level_parser().parse_args(argv)
         return 0
+    if command == "remote":
+        from kikai_lab.remote_client import command_remote
+        return command_remote(argv[1:])
     if command == "target":
         return command_target(argv)
     if command == "exec":
