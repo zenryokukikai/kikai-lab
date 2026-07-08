@@ -4362,6 +4362,20 @@ def execute_checkpoint_retention_operation(request: dict[str, Any]) -> dict[str,
         code="operation.checkpoint_retention_dry_run_invalid",
         message="checkpoint_retention request.dry_run must be a boolean",
     )
+    # protect_steps: checkpoints the caller knows still have pending QC/probe work.
+    # Fail-closed parsing — a malformed list must not silently protect nothing.
+    protect_steps_raw = request.get("protect_steps")
+    protect_steps: set[int] = set()
+    if protect_steps_raw is not None:
+        if not isinstance(protect_steps_raw, list) or any(
+            not isinstance(s, int) or isinstance(s, bool) for s in protect_steps_raw
+        ):
+            raise OperationError(
+                "operation.checkpoint_retention_protect_steps_invalid",
+                "checkpoint_retention request.protect_steps must be a list of ints",
+                {"protect_steps": protect_steps_raw},
+            )
+        protect_steps = {int(s) for s in protect_steps_raw}
     config = load_checkpoint_retention_config(request, project_root)
 
     checkpoint_dir = run_dir / "checkpoints"
@@ -4483,6 +4497,17 @@ def execute_checkpoint_retention_operation(request: dict[str, Any]) -> dict[str,
                 kept_milestones.append(record["name"])
             protected.add(record["name"])
 
+    # pending-QC protection: never delete a checkpoint whose diagnostics have not
+    # run yet — QC/probe ops are serialized and can lag many checkpoints behind a
+    # fast trainer. The caller (reconcile) computes the pending set; give-up-capped
+    # steps are excluded there, so a permanently-broken op cannot pin disk forever.
+    kept_pending_qc: list[str] = []
+    for record in records:
+        if record["family"] == "latest" and record["step"] in protect_steps:
+            if record["name"] not in protected:
+                kept_pending_qc.append(record["name"])
+            protected.add(record["name"])
+
     deleted: list[str] = []
     for record in records:
         if record["name"] in protected:
@@ -4506,6 +4531,7 @@ def execute_checkpoint_retention_operation(request: dict[str, Any]) -> dict[str,
         "kept_latest": kept_latest,
         "kept_best": kept_best,
         "kept_milestones": kept_milestones,
+        "kept_pending_qc": kept_pending_qc,
         "deleted": deleted,
         "best_checkpoint_pointer": best_checkpoint_pointer,
         "config": config,

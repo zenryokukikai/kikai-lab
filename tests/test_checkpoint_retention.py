@@ -451,3 +451,80 @@ def test_keep_milestones_fail_closed_validation(tmp_path):
     # rolling window protects
     assert (run_dir / "checkpoints" / "checkpoint_step_001000_loss1p0.pt").exists()
     assert (run_dir / "checkpoints" / "checkpoint_step_000500_loss2p0.pt").exists()
+
+
+def test_protect_steps_shields_pending_qc_checkpoints(tmp_path):
+    """protect_steps keeps checkpoints no rolling window would save (pending QC)."""
+    project_root = tmp_path / "registry"
+    run_dir, ckpt_dir = make_run(
+        tmp_path,
+        [
+            "checkpoint_step_001000_loss30p0.pt",
+            "checkpoint_step_002000_loss20p0.pt",
+            "checkpoint_step_003000_loss25p0.pt",
+            "checkpoint_step_004000_loss15p0.pt",
+        ],
+    )
+    result = run_retention(
+        tmp_path,
+        project_root,
+        run_dir,
+        request_extra={
+            "keep_latest": 1,
+            "keep_best": 0,
+            "protect_steps": [1000, 2000],
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)["data"]
+    assert data["kept_latest"] == ["checkpoint_step_004000_loss15p0.pt"]
+    assert set(data["kept_pending_qc"]) == {
+        "checkpoint_step_001000_loss30p0.pt",
+        "checkpoint_step_002000_loss20p0.pt",
+    }
+    assert data["deleted"] == ["checkpoint_step_003000_loss25p0.pt"]
+    assert (ckpt_dir / "checkpoint_step_001000_loss30p0.pt").exists()
+    assert (ckpt_dir / "checkpoint_step_002000_loss20p0.pt").exists()
+    assert not (ckpt_dir / "checkpoint_step_003000_loss25p0.pt").exists()
+
+
+def test_protect_steps_already_windowed_not_double_reported(tmp_path):
+    """A step both in the latest window and protect_steps is reported once (latest)."""
+    project_root = tmp_path / "registry"
+    run_dir, _ = make_run(
+        tmp_path,
+        ["checkpoint_step_001000_loss2p0.pt", "checkpoint_step_002000_loss1p0.pt"],
+    )
+    result = run_retention(
+        tmp_path,
+        project_root,
+        run_dir,
+        request_extra={"keep_latest": 1, "keep_best": 0, "protect_steps": [2000]},
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)["data"]
+    assert data["kept_latest"] == ["checkpoint_step_002000_loss1p0.pt"]
+    assert data["kept_pending_qc"] == []
+
+
+def test_protect_steps_fail_closed_validation(tmp_path):
+    """Malformed protect_steps must error out, deleting nothing."""
+    run_dir, _ = make_run(
+        tmp_path,
+        ["checkpoint_step_000500_loss2p0.pt", "checkpoint_step_001000_loss1p0.pt"],
+    )
+    for bad in ("not-a-list", [True], ["1000"], [1000.5]):
+        op = tmp_path / "ops" / "retention_bad_protect.json"
+        write_retention_operation(
+            op, tmp_path, run_dir,
+            request_extra={"keep_latest": 1, "keep_best": 0, "protect_steps": bad},
+        )
+        dry = run_cli("target", "dry-run", str(op))
+        assert dry.returncode == 0, dry.stderr  # receipt only; parsing happens at exec
+        result = run_cli("exec", str(op))
+        assert result.returncode != 0, f"protect_steps {bad!r} was accepted"
+        assert "checkpoint_retention_protect_steps_invalid" in (
+            result.stdout + result.stderr
+        )
+    assert (run_dir / "checkpoints" / "checkpoint_step_000500_loss2p0.pt").exists()
+    assert (run_dir / "checkpoints" / "checkpoint_step_001000_loss1p0.pt").exists()

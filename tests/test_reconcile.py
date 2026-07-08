@@ -89,6 +89,7 @@ class FakeExec:
             "deleted": [],
             "kept_latest": [],
             "kept_best": [],
+            "kept_pending_qc": [],
         }
 
     def __call__(self, op):
@@ -1958,3 +1959,75 @@ def test_probe_timeout_sec_passthrough(tmp_path):
                    execute=ex, inspect=fake_inspect(running=True))
     probe_reqs = [c for c in ex.calls if c.get("adapter") == "script_bundle_run"]
     assert probe_reqs and probe_reqs[0]["timeout_sec"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# retention vs pending QC/probes: never delete a checkpoint whose diagnostics
+# have not run (or been given up on) — the QC queue can lag a fast trainer
+# --------------------------------------------------------------------------- #
+def test_pending_qc_steps_computation(tmp_path):
+    run_dir = make_run_dir(
+        tmp_path,
+        [
+            "checkpoint_step_001000_loss0p5.pt",
+            "checkpoint_step_002000_loss0p4.pt",
+            "checkpoint_step_003000_loss0p3.pt",
+            "checkpoint_step_004000_loss0p2.pt",
+        ],
+    )
+    mr = managed_run(
+        run_dir,
+        max_step=3000,
+        probes=[{
+            "id": "pv", "every_steps": 2000, "bundle_id": "diag_bundle",
+            "container_id": "qc_runner", "entrypoint": "generate",
+            "project_root": "/x", "args": [],
+        }],
+    )
+    progress = reconcile.default_progress("r")
+    progress["qc_done_steps"] = [1000]
+    # probe pv exhausted its failures at 2000 -> no longer pending there
+    progress["op_fail_counts"] = {"probe:pv:2000": reconcile.MAX_OP_FAILURES}
+    pending = reconcile.pending_qc_steps(mr, run_dir, progress)
+    # qc_op pending: 2000, 3000 (1000 done, 4000 > max_step)
+    # probe pv pending: none (2000 gave up, 4000 > max_step, 1000/3000 not % 2000)
+    assert pending == [2000, 3000]
+
+
+def test_retention_request_protects_unqcd_steps_when_qc_fails(tmp_path):
+    project_root = make_registry(tmp_path)
+    run_dir = make_run_dir(tmp_path, ["checkpoint_step_001000_loss0p5.pt"])
+    mr = managed_run(run_dir)
+    ex = FakeExec(fail_adapters=("script_bundle_run",))
+    reconcile.tick(project_root, mr, reconcile.default_progress("r"),
+                   execute=ex, inspect=fake_inspect())
+    retention_requests = [c for c in ex.calls if c.get("adapter") == "checkpoint_retention"]
+    assert retention_requests, "retention did not run"
+    assert retention_requests[0].get("protect_steps") == [1000]
+
+
+def test_retention_request_has_no_protect_steps_when_qc_done(tmp_path):
+    project_root = make_registry(tmp_path)
+    run_dir = make_run_dir(tmp_path, ["checkpoint_step_001000_loss0p5.pt"])
+    mr = managed_run(run_dir)
+    ex = FakeExec()
+    reconcile.tick(project_root, mr, reconcile.default_progress("r"),
+                   execute=ex, inspect=fake_inspect())
+    retention_requests = [c for c in ex.calls if c.get("adapter") == "checkpoint_retention"]
+    assert retention_requests, "retention did not run"
+    # QC succeeded earlier in the SAME tick -> nothing pending at retention time
+    assert "protect_steps" not in retention_requests[0]
+
+
+def test_pending_qc_steps_counts_qc_op_template_runs(tmp_path):
+    """qc_op_template-configured runs (no inline qc_op) must also be protected —
+    the gating must mirror the tick's qc_configured check."""
+    run_dir = make_run_dir(tmp_path, ["checkpoint_step_001000_loss0p5.pt"])
+    mr = managed_run(run_dir)
+    del mr["qc_op"]
+    mr["qc_op_template"] = "ops/qc_template.json"
+    pending = reconcile.pending_qc_steps(mr, run_dir, reconcile.default_progress("r"))
+    assert pending == [1000]
+    # and with neither configured, nothing is owed
+    del mr["qc_op_template"]
+    assert reconcile.pending_qc_steps(mr, run_dir, reconcile.default_progress("r")) == []

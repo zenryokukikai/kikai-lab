@@ -645,10 +645,72 @@ def record_qc_artifacts(
     return recorded
 
 
-def build_retention_op(project_root: Path, managed_run: dict[str, Any]) -> dict[str, Any]:
+def pending_qc_steps(
+    managed_run: dict[str, Any], run_dir: Path, progress: dict[str, Any]
+) -> list[int]:
+    """Checkpoint steps whose qc_op or probes[] work has NOT run yet (and has not
+    given up). Retention must never delete these: QC ops are serialized and can lag
+    many checkpoints behind a fast trainer, so "retention runs after QC in the tick"
+    alone still deletes checkpoints whose diagnostics are merely queued (observed in
+    production: per-checkpoint probes 100% docker_run_failed against pruned files).
+
+    The skip predicates below MUST mirror the qc_op loop and the probes loop in
+    tick() (done / max_step / every_steps / give-up) — if those loops learn a new
+    skip condition, add it here too, or retention protection silently diverges from
+    what actually runs. The pending set is self-bounding: every enumerated step is
+    attempted each tick, so a persistently failing step exits via the give-up cap
+    after MAX_OP_FAILURES ticks instead of pinning disk forever."""
+    steps = [s for s, _ in checkpoint_steps(run_dir)]
+    if not steps:
+        return []
+    max_step = managed_run.get("max_step")
+    fail_counts = progress.get("op_fail_counts") or {}
+
+    def exhausted(fail_key: str) -> bool:
+        # _gave_up()'s threshold, WITHOUT calling it: _gave_up records the give-up
+        # and persists a tick error, and this is a read-only computation.
+        return int(fail_counts.get(fail_key, 0)) >= MAX_OP_FAILURES
+
+    pending: set[int] = set()
+    # SAME gating as the tick's QC loop: inline qc_op OR a qc_op_template file.
+    qc_configured = ("qc_op" in managed_run) or bool(managed_run.get("qc_op_template"))
+    if qc_configured:
+        done = {int(s) for s in progress.get("qc_done_steps") or []}
+        for step in steps:
+            if max_step is not None and step > int(max_step):
+                continue
+            if step in done or exhausted(f"qc:{step}"):
+                continue
+            pending.add(step)
+    probes_done_all = progress.get("probes_done_steps") or {}
+    for probe in managed_run.get("probes") or []:
+        probe_id = str(probe.get("id") or "")
+        if not probe_id:
+            continue
+        every = probe.get("every_steps")
+        done = {int(s) for s in probes_done_all.get(probe_id) or []}
+        for step in steps:
+            if max_step is not None and step > int(max_step):
+                continue
+            if every is not None and int(step) % int(every) != 0:
+                continue
+            if step in done or exhausted(f"probe:{probe_id}:{step}"):
+                continue
+            pending.add(step)
+    return sorted(pending)
+
+
+def build_retention_op(
+    project_root: Path,
+    managed_run: dict[str, Any],
+    run_dir: Path | None = None,
+    progress: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """checkpoint_retention runs IN-PROCESS on the daemon's own rw mount, so ``run_dir``
     is the daemon-local path. keep_latest/keep_best come from the managed_run's
-    ``retention`` block, else the experiment yaml (``experiment_id``)."""
+    ``retention`` block, else the experiment yaml (``experiment_id``). When run_dir and
+    progress are supplied, checkpoints with pending qc_op/probe work are passed as
+    ``protect_steps`` so retention cannot outrun the QC queue."""
     request: dict[str, Any] = {
         "adapter": "checkpoint_retention",
         "operation": f"{managed_run['run_id']}_checkpoint_retention",
@@ -661,6 +723,10 @@ def build_retention_op(project_root: Path, managed_run: dict[str, Any]) -> dict[
     for key in ("keep_latest", "keep_best", "keep_milestones", "metric_key", "metric_mode"):
         if key in retention:
             request[key] = retention[key]
+    if run_dir is not None and progress is not None:
+        protect = pending_qc_steps(managed_run, run_dir, progress)
+        if protect:
+            request["protect_steps"] = protect
     return {"kind": "kikai_operation", "schema_version": 1, "request": request}
 
 
@@ -1283,14 +1349,21 @@ def tick(
     # OSError (e.g. root-owned checkpoints the daemon user cannot unlink) is an
     # OPERATIONAL failure: it must surface as a retention error breadcrumb and let the
     # tick continue to finalize — not abort the whole tick as reconcile.tick_failed.
-    try:
-        retention_result = execute(build_retention_op(project_root, managed_run))
-        summary["retention"] = {
-            "status": retention_result.get("execution_status"),
-            "deleted": retention_result.get("deleted"),
-            "kept_latest": retention_result.get("kept_latest"),
-            "kept_best": retention_result.get("kept_best"),
+    def retention_summary(result: dict[str, Any], **extra: Any) -> dict[str, Any]:
+        return {
+            "status": result.get("execution_status"),
+            "deleted": result.get("deleted"),
+            "kept_latest": result.get("kept_latest"),
+            "kept_best": result.get("kept_best"),
+            "kept_pending_qc": result.get("kept_pending_qc"),
+            **extra,
         }
+
+    try:
+        retention_result = execute(
+            build_retention_op(project_root, managed_run, run_dir, progress)
+        )
+        summary["retention"] = retention_summary(retention_result)
         steps_now = [s for s, _ in checkpoint_steps(run_dir)]
         if steps_now:
             progress["last_retention_step"] = max(steps_now)
@@ -1306,14 +1379,12 @@ def tick(
             # one-shot docker chown and retry retention ONCE, this tick
             try:
                 execute(build_run_dir_chown_op(project_root, managed_run))
-                retention_result = execute(build_retention_op(project_root, managed_run))
-                summary["retention"] = {
-                    "status": retention_result.get("execution_status"),
-                    "deleted": retention_result.get("deleted"),
-                    "kept_latest": retention_result.get("kept_latest"),
-                    "kept_best": retention_result.get("kept_best"),
-                    "repaired_via_chown": True,
-                }
+                retention_result = execute(
+                    build_retention_op(project_root, managed_run, run_dir, progress)
+                )
+                summary["retention"] = retention_summary(
+                    retention_result, repaired_via_chown=True
+                )
                 steps_now = [s for s, _ in checkpoint_steps(run_dir)]
                 if steps_now:
                     progress["last_retention_step"] = max(steps_now)
