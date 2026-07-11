@@ -1379,3 +1379,222 @@ def test_qc_op_bad_entrypoint_rejected_at_submit(tmp_path: Path, monkeypatch) ->
     err = resp.json()["errors"][0]
     assert "entrypoint_missing" in err["code"], err
     assert (err.get("details") or {}).get("where") == "managed.qc_op"
+
+
+# --------------------------------------------------------------------------- #
+# POST /runs/{run}/qc-config: live partial update of managed probes / qc_op
+# --------------------------------------------------------------------------- #
+def _valid_qc_op(entrypoint: str = "train") -> dict:
+    return {
+        "kind": "kikai_operation",
+        "schema_version": 1,
+        "request": {
+            "adapter": "script_bundle_run",
+            "operation": "qc_step{{step6}}",
+            "bundle_id": "example_trainer_v1",
+            "entrypoint": entrypoint,
+            "container_id": "example_training",
+            "project_root": "/project",
+            "args": ["--out", "${CONTAINER_RUNS_ROOT}/r/qc/{{step6}}.mp4"],
+        },
+    }
+
+
+def _managed_run_yaml(tmp_path: Path, run_name: str = "example_run_a") -> dict:
+    path = tmp_path / "example_new" / "managed_runs" / f"{run_name}.yaml"
+    return yaml.safe_load(path.read_text())
+
+
+def _qc_config(client, body: dict, run_name: str = "example_run_a"):
+    return client.post(
+        f"/v1/projects/example_new/runs/{run_name}/qc-config", json=body
+    )
+
+
+def _submit_managed_with_qc(client, **managed_extra):
+    managed = {
+        "max_step": 100,
+        "retention": {"keep_latest": 2, "keep_best": 1},
+        "qc_op": _valid_qc_op(),
+        "probes": [_valid_probe()],
+        **managed_extra,
+    }
+    resp = submit(client, managed=managed)
+    assert resp.status_code == 201, resp.text
+    return resp
+
+
+def test_qc_config_probes_only_update_preserves_qc_op(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    _submit_managed_with_qc(client)
+
+    new_probe = _valid_probe(pid="heldout")
+    new_probe["args"] = new_probe["args"] + ["--lead-seconds", "3", "--tail-seconds", "3"]
+    resp = _qc_config(client, {"probes": [new_probe]})
+    assert resp.status_code == 201, resp.text
+    data = resp.json()["data"]
+    assert data["updated"] == ["probes"]
+    assert data["removed"] == []
+
+    mr = _managed_run_yaml(tmp_path)
+    assert mr["probes"][0]["args"][-4:] == ["--lead-seconds", "3", "--tail-seconds", "3"]
+    # qc_op was not in the body: untouched on disk
+    assert mr["qc_op"] == _valid_qc_op()
+    # unrelated managed keys survive the partial update
+    assert mr["max_step"] == 100
+    assert mr["retention"] == {"keep_latest": 2, "keep_best": 1}
+
+
+def test_qc_config_qc_op_only_update_preserves_probes(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    _submit_managed_with_qc(client)
+
+    new_qc_op = _valid_qc_op()
+    new_qc_op["request"]["args"] = ["--out", "x/{{step6}}.mp4", "--lead-seconds", "3"]
+    resp = _qc_config(client, {"qc_op": new_qc_op})
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["data"]["updated"] == ["qc_op"]
+
+    mr = _managed_run_yaml(tmp_path)
+    assert mr["qc_op"]["request"]["args"] == ["--out", "x/{{step6}}.mp4", "--lead-seconds", "3"]
+    assert [p["id"] for p in mr["probes"]] == ["heldout"]
+
+
+def test_qc_config_updates_both_keys_at_once(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    _submit_managed_with_qc(client)
+
+    resp = _qc_config(
+        client,
+        {"probes": [_valid_probe(pid="p2")], "qc_op": _valid_qc_op()},
+    )
+    assert resp.status_code == 201, resp.text
+    data = resp.json()["data"]
+    assert sorted(data["updated"]) == ["probes", "qc_op"]
+    mr = _managed_run_yaml(tmp_path)
+    assert [p["id"] for p in mr["probes"]] == ["p2"]
+
+
+def test_qc_config_null_removes_key(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    _submit_managed_with_qc(client)
+
+    resp = _qc_config(client, {"probes": None})
+    assert resp.status_code == 201, resp.text
+    data = resp.json()["data"]
+    assert data["removed"] == ["probes"]
+    mr = _managed_run_yaml(tmp_path)
+    assert "probes" not in mr
+    assert mr["qc_op"] == _valid_qc_op()  # untouched
+
+
+def test_qc_config_bad_probe_bundle_rejected_and_yaml_untouched(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    _submit_managed_with_qc(client)
+    before = _managed_run_yaml(tmp_path)
+
+    p = _valid_probe()
+    p["bundle_id"] = "nonexistent_bundle"
+    resp = _qc_config(client, {"probes": [p]})
+    assert resp.status_code in (404, 422), resp.text
+    err = resp.json()["errors"][0]
+    assert "not_found" in err["code"] or "missing" in err["code"], err
+    assert (err.get("details") or {}).get("where", "").startswith("managed.probes[0]")
+    assert _managed_run_yaml(tmp_path) == before  # rejected update never lands
+
+
+def test_qc_config_structurally_invalid_probes_rejected_422(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    _submit_managed_with_qc(client)
+    before = _managed_run_yaml(tmp_path)
+
+    resp = _qc_config(client, {"probes": [_valid_probe(), _valid_probe()]})  # dup ids
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["errors"][0]["code"] == "run.record_invalid"
+    assert _managed_run_yaml(tmp_path) == before
+
+
+def test_qc_config_bad_qc_op_entrypoint_rejected(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    _submit_managed_with_qc(client)
+    before = _managed_run_yaml(tmp_path)
+
+    resp = _qc_config(client, {"qc_op": _valid_qc_op(entrypoint="typo_entrypoint")})
+    assert resp.status_code != 201
+    err = resp.json()["errors"][0]
+    assert "entrypoint_missing" in err["code"], err
+    assert (err.get("details") or {}).get("where") == "managed.qc_op"
+    assert _managed_run_yaml(tmp_path) == before
+
+
+def test_qc_config_unknown_run_404(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    resp = _qc_config(client, {"probes": []}, run_name="no_such_run")
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["errors"][0]["code"] == "run.not_found"
+
+
+def test_qc_config_unmanaged_run_404(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    body = submission_body()
+    del body["managed"]  # unmanaged submission: no managed_runs yaml
+    resp = client.post("/v1/projects/example_new/runs/example_run_a/submit", json=body)
+    assert resp.status_code == 201, resp.text
+    assert not (
+        tmp_path / "example_new" / "managed_runs" / "example_run_a.yaml"
+    ).exists()
+
+    resp = _qc_config(client, {"probes": [_valid_probe()]})
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["errors"][0]["code"] == "run.managed_run_missing"
+
+
+def test_qc_config_unknown_key_rejected_422(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    _submit_managed_with_qc(client)
+    resp = _qc_config(client, {"probes": [], "max_step": 200})
+    assert resp.status_code == 422, resp.text
+    err = resp.json()["errors"][0]
+    assert err["code"] == "run.qc_config_invalid"
+    assert (err.get("details") or {}).get("unknown") == ["max_step"]
+
+
+def test_qc_config_empty_body_rejected_422(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    _submit_managed_with_qc(client)
+    resp = _qc_config(client, {})
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["errors"][0]["code"] == "run.qc_config_invalid"
+
+
+def test_qc_config_new_probe_id_warns_about_backfill(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    _submit_managed_with_qc(client)
+
+    resp = _qc_config(
+        client, {"probes": [_valid_probe(), _valid_probe(pid="brand_new")]}
+    )
+    assert resp.status_code == 201, resp.text
+    warnings = resp.json().get("warnings") or []
+    codes = [w["code"] for w in warnings]
+    assert "run.qc_config_probe_backfill" in codes
+    backfill = next(w for w in warnings if w["code"] == "run.qc_config_probe_backfill")
+    assert backfill["details"]["new_probe_ids"] == ["brand_new"]
+
+
+def test_qc_config_journal_records_update(tmp_path: Path, monkeypatch) -> None:
+    client = _make_probe_client(tmp_path, monkeypatch)
+    _submit_managed_with_qc(client)
+    resp = _qc_config(client, {"qc_op": None})
+    assert resp.status_code == 201, resp.text
+
+    journal = tmp_path / "example_new" / "journal.jsonl"
+    events = [json.loads(line) for line in journal.read_text().splitlines()]
+    qc_events = [e for e in events if e.get("kind") == "run_qc_config_updated"]
+    assert len(qc_events) == 1
+    assert qc_events[0]["run_name"] == "example_run_a"
+    assert qc_events[0]["removed"] == ["qc_op"]

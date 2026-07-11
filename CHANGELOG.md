@@ -20,6 +20,10 @@ pre-1.0, so minor versions may contain breaking API changes.
 - Live control plane: `POST /runs/{run}/control` changes a running run's
   `max_steps` / early-stopping / graceful stop with no restart, via
   `<run_dir>/control.json`.
+- Live QC config: `POST /runs/{run}/qc-config` updates a managed run's
+  `probes` / `qc_op` (key-level partial update, `null` removes) with full
+  submit-time validation of the merged record; the reconciler picks the new
+  config up on its next tick.
 - `brief` and `journal` endpoints for one-call session resume.
 - Run conclusions (verdict + evidence) recorded with the run.
 - Declarative `evaluations` / `metric_checks` run by the reconciler, with

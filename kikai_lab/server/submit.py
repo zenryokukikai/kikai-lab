@@ -1295,6 +1295,123 @@ def build_submit_router(config: ServerConfig) -> APIRouter:
             data={"run_name": run_name, "requested": requested, "applied": applied},
         )
 
+    @router.post("/projects/{project_id}/runs/{run_name}/qc-config")
+    def run_qc_config_update(
+        project_id: str,
+        run_name: str,
+        body: Annotated[dict[str, Any], Body()] = ...,
+    ) -> JSONResponse:
+        """Update a managed run's per-checkpoint QC configuration (``probes`` /
+        ``qc_op``) without a restart and without hand-editing the yaml. Partial
+        update: only the keys present in the body are replaced (``null`` removes
+        the key). The same submit-time validation applies — bad bundle /
+        entrypoint / container references die here, not across 60 silent QC
+        ticks. The reconciler reloads ``managed_runs/<run>.yaml`` every tick, so
+        the new config drives the NEXT cycle; checkpoints whose QC/probe work is
+        already recorded in progress.json are not re-run."""
+        path = require_active_project(config, project_id)
+        run_name = require_safe_id(run_name, kind="run")
+        require_run_record(path, run_name)
+        if not isinstance(body, dict) or not body:
+            raise OperationError(
+                "run.qc_config_invalid",
+                "qc-config body must be a non-empty JSON object",
+                {"run_name": run_name},
+            )
+        allowed = ("probes", "qc_op")
+        unknown = sorted(set(body) - set(allowed))
+        if unknown:
+            raise OperationError(
+                "run.qc_config_invalid",
+                "unknown qc-config keys (whitelist: probes, qc_op)",
+                {"unknown": unknown},
+            )
+        if body.get("qc_op") is not None and not isinstance(body["qc_op"], dict):
+            raise OperationError(
+                "run.qc_config_invalid",
+                "qc_op must be an object (a kikai_operation) or null to remove",
+                {"got_type": type(body["qc_op"]).__name__},
+            )
+
+        with WRITE_LOCK:
+            require_active_project(config, project_id)
+            managed_path = path / "managed_runs" / f"{run_name}.yaml"
+            if not managed_path.is_file():
+                raise OperationError(
+                    "run.managed_run_missing",
+                    "run has no managed_run record — QC config only applies to "
+                    "managed submissions",
+                    {"run_name": run_name},
+                )
+            record = load_yaml_record(managed_path, kind="managed_run")
+            previous_probe_ids = {
+                p.get("id")
+                for p in (record.get("probes") or [])
+                if isinstance(p, dict)
+            }
+            updated: list[str] = []
+            removed: list[str] = []
+            for key in allowed:
+                if key not in body:
+                    continue
+                if body[key] is None:
+                    if key in record:
+                        del record[key]
+                        removed.append(key)
+                else:
+                    record[key] = body[key]
+                    updated.append(key)
+            # Validate the MERGED record, same checks as submit time: a partial
+            # update must not be able to write a managed_run that submit would
+            # have rejected.
+            _validate_qc_op_refs(path, record)
+            _validate_probes_field(path, record)
+            validate_record_schema(record, "managed_run", kind="managed_run")
+            atomic_write_yaml(managed_path, record)
+
+        qc_warnings: list[dict[str, Any]] = []
+        new_probe_ids = sorted(
+            {
+                str(p["id"])
+                for p in (record.get("probes") or [])
+                if isinstance(p, dict) and p.get("id") is not None
+            }
+            - {str(pid) for pid in previous_probe_ids if pid is not None}
+        )
+        if new_probe_ids:
+            # progress.json tracks done steps per probe id — an id the reconciler
+            # has never seen has zero done steps, so it backfills every retained
+            # checkpoint on the next tick. Intentional, but say so on the wire.
+            qc_warnings.append(
+                error(
+                    "run.qc_config_probe_backfill",
+                    "new probe ids run against every retained checkpoint not "
+                    "yet probed (backfill on the next reconcile tick)",
+                    blocking=False,
+                    details={"new_probe_ids": new_probe_ids},
+                )
+            )
+        append_journal(
+            path,
+            "run_qc_config_updated",
+            {"run_name": run_name, "updated": updated, "removed": removed},
+        )
+        return envelope_response(
+            ok=True,
+            warnings=qc_warnings,
+            data={
+                "run_name": run_name,
+                "updated": updated,
+                "removed": removed,
+                "probes": record.get("probes"),
+                "qc_op": record.get("qc_op"),
+                "note": "the reconciler reloads managed_runs/<run>.yaml every "
+                "tick — the new QC config drives the next cycle; already-QCed "
+                "checkpoints are not re-run",
+            },
+            status_code=201,
+        )
+
     @router.post("/projects/{project_id}/runs/{run_name}/conclusion")
     def run_conclusion(
         project_id: str,

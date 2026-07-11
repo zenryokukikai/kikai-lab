@@ -253,6 +253,31 @@ curl -X POST $BASE/projects/example_proj/runs/example_run_001/control \
 - A graceful stop finalizes with derived status `stopped` (terminal event
   `stopped_by_control`).
 
+## Live QC config (change a running run's probes / qc_op)
+
+Changing a checkpoint-QC argument mid-run (e.g. adding `--lead-seconds 3` to a
+preview probe) is a registry edit, not a resubmit — and hand-editing
+`managed_runs/<run>.yaml` bypasses validation:
+
+```bash
+curl -X POST $BASE/projects/example_proj/runs/example_run_001/qc-config \
+  -H 'content-type: application/json' \
+  -d '{"probes": [{"id": "preview", "bundle_id": "...", "entrypoint": "...",
+       "container_id": "...", "project_root": "/project",
+       "args": ["--lead-seconds", "3", "--tail-seconds", "3"]}]}'
+```
+
+- Whitelist: `probes` (full replacement array) and/or `qc_op` (full replacement
+  object); `null` removes the key. Keys you omit are untouched (partial update at
+  the key level). Unknown keys are 422.
+- The MERGED record gets the same validation as submit time (bundle/entrypoint/
+  container references, probe structure, managed_run schema) — a bad reference
+  dies here, not across 60 silent QC ticks. A rejected update never lands.
+- The reconciler re-reads `managed_runs/<run>.yaml` every tick: the new config
+  drives the NEXT cycle. Checkpoints whose qc_op/probe work is already recorded
+  in progress are not re-run; a NEW probe `id` backfills every retained
+  checkpoint (the response warns with `run.qc_config_probe_backfill`).
+
 ## Stopping / resuming
 
 - `POST .../runs/{run}/stop` — idempotent; the reconciler finalizes (retention +
