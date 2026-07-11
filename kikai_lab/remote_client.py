@@ -13,6 +13,8 @@ Subcommands::
   kikai remote daemon <project>                      # heartbeat one-liner
   kikai remote run <project> <run>                   # status + progress digest
   kikai remote metrics <project> <run> --keys a,b    # first/quartile/last trend
+  kikai remote artifacts <project> <run> [--path d]  # run_dir listing (ssh-free)
+  kikai remote artifacts <project> <run> --file f    # small text file content
   kikai remote op <project> --file req.json          # run op; script events auto-extracted
   kikai remote submit-from <project> <run> <parent> --overrides-file f.json
   kikai remote stop <project> <run>
@@ -30,6 +32,7 @@ import re
 import sys
 import tarfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -132,15 +135,74 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     pd = p.get("probes_done_steps") or {}
     probes = ", ".join(f"{k}:{len(v)}" for k, v in pd.items()) or "-"
+    fails = p.get("op_fail_counts") or {}
+    fail_text = ", ".join(f"{k}:{v}" for k, v in fails.items()) or "-"
     print(
         f"qc_done={len(p.get('qc_done_steps') or [])} probes={{{probes}}} "
-        f"gave_up={p.get('op_gave_up') or '-'}"
+        f"fails={{{fail_text}}} gave_up={p.get('op_gave_up') or '-'}"
     )
+    bad = _delivery_failures(p)
+    if bad:
+        print(f"delivery_failures: {json.dumps(bad, ensure_ascii=False)[:300]}")
     if p.get("last_error"):
         print(f"last_error: {p['last_error']}")
     for line in _err_lines(env):
         print(line)
     return 0
+
+
+def _delivery_failures(progress: dict[str, Any], limit: int = 5) -> list[dict[str, Any]]:
+    """Non-2xx delivery outcomes from progress['delivery'] (newest last)."""
+    out = []
+    for key, entry in (progress.get("delivery") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        status = entry.get("status")
+        if isinstance(status, int) and 200 <= status < 300:
+            continue
+        out.append({"key": key, **entry})
+    return out[-limit:]
+
+
+def cmd_artifacts(args: argparse.Namespace) -> int:
+    base = f"{_base_url(args)}/v1/projects/{args.project}/runs/{args.run}/artifacts"
+    if args.file:
+        query = urllib.parse.urlencode(
+            {
+                "path": args.file,
+                "max_bytes": args.max_bytes,
+                "tail": "true" if args.tail else "false",
+            }
+        )
+        env = _http("GET", f"{base}/file?{query}")
+        if args.json:
+            return _print_json(env)
+        d = env.get("data") or {}
+        if env.get("ok") and not d.get("binary"):
+            if d.get("truncated"):
+                which = "last" if d.get("tail") else "first"
+                print(f"# truncated: {which} {args.max_bytes} of {d.get('size')} bytes")
+            sys.stdout.write(d.get("content") or "")
+        elif env.get("ok"):
+            print(f"binary size={d.get('size')} (metadata only; no content served)")
+        for line in _err_lines(env):
+            print(line)
+        return 0 if env.get("ok") else 1
+    query = urllib.parse.urlencode({"path": args.path, "depth": args.depth})
+    env = _http("GET", f"{base}?{query}")
+    if args.json:
+        return _print_json(env)
+    d = env.get("data") or {}
+    for e in d.get("entries") or []:
+        kind = "d" if e.get("is_dir") else "f"
+        size = "-" if e.get("size") is None else e["size"]
+        print(f"{kind} {size:>12} {e.get('path')}")
+    total = d.get("total", 0)
+    if env.get("ok"):
+        print(f"total={total}" + (" (truncated)" if d.get("truncated") else ""))
+    for line in _err_lines(env):
+        print(line)
+    return 0 if env.get("ok") else 1
 
 
 def cmd_metrics(args: argparse.Namespace) -> int:
@@ -376,6 +438,17 @@ def command_remote(argv: list[str]) -> int:
     s.add_argument("--max-points", type=int, default=40)
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_metrics)
+
+    s = sub.add_parser("artifacts")
+    s.add_argument("project")
+    s.add_argument("run")
+    s.add_argument("--path", default="", help="relative dir inside the run_dir")
+    s.add_argument("--depth", type=int, default=1)
+    s.add_argument("--file", default="", help="fetch this relative file instead")
+    s.add_argument("--max-bytes", type=int, default=65536)
+    s.add_argument("--tail", action="store_true", help="last max-bytes of --file")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_artifacts)
 
     s = sub.add_parser("op")
     s.add_argument("project")

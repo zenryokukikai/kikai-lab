@@ -120,6 +120,27 @@ milestone anchors — they survive outside the rolling windows:
 - `GET .../runs/{run}/logs?tail=200` — container log tail.
 - Artifacts: `GET .../artifacts?run_name=...`, then
   `GET .../artifacts/{id}/content` for bytes (videos support Range).
+- **Inspect the run_dir without ssh** —
+  `GET .../runs/{run}/artifacts?path=qc&depth=2` lists files/dirs
+  (`path`/`size`/`mtime`/`is_dir`, sandboxed to the run_dir — traversal and
+  symlink escapes are 403), and
+  `GET .../runs/{run}/artifacts/file?path=qc/step012000/summary.json&max_bytes=65536`
+  returns small TEXT/JSON content (`tail=true` reads the end — metrics tails);
+  binary files return metadata only (fetch media via the artifact ledger's
+  `/content`). CLI: `kikai remote artifacts <proj> <run> [--path d --depth 2]`
+  or `--file <rel> [--tail]`.
+
+### Is my QC/diagnostic pipeline alive? (no host access needed)
+
+`/status` carries the reconciler's whole progress digest, not just
+`qc_done_steps`: `probes_done_steps` (per probe id), `op_fail_counts` /
+`op_gave_up` (consecutive failures and permanently-skipped steps, keyed
+`qc:<step>` / `probe:<id>:<step>`), `last_error`, and `delivery_failures` —
+the recent QC/probe delivery outcomes that were NOT a 2xx post: explicit
+skips (`skipped_reason`), failed posts (`status`), or ops that emitted no
+delivery event at all (`no_delivery_event`). "The video rendered but never
+arrived" is answered here; `kikai remote run <proj> <run>` prints the same
+digest.
 
 ## Iterating: submit-from (differential submission)
 

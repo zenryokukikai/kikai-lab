@@ -190,6 +190,24 @@ def derive_status(
     return "unknown"
 
 
+def recent_delivery_failures(
+    progress: dict[str, Any], limit: int = 20
+) -> list[dict[str, Any]]:
+    """The most recent non-delivered QC/probe outcomes from progress['delivery']
+    (written by the reconciler): anything whose recorded status is not a 2xx —
+    explicit skips, non-2xx posts, and ops that emitted no delivery event at all.
+    Keys share the op_fail_counts vocabulary (qc:<step> / probe:<id>:<step>)."""
+    failures: list[dict[str, Any]] = []
+    for key, entry in (progress.get("delivery") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        status = entry.get("status")
+        if isinstance(status, int) and 200 <= status < 300:
+            continue
+        failures.append({"key": key, **entry})
+    return failures[-limit:]
+
+
 def require_run_record(project_root: Path, run_name: str) -> dict[str, Any]:
     run_path = project_root / "runs" / f"{run_name}.yaml"
     if not run_path.is_file():
@@ -517,7 +535,14 @@ def build_runs_router(config: ServerConfig) -> APIRouter:
                 },
                 "latest_step": latest.get("step") if latest else None,
                 "latest_loss": latest.get("loss") if latest else None,
+                # progress.json digest: the reconciler's whole view of QC/probe
+                # health, so "is my diagnostic pipeline alive" needs no host access.
                 "qc_done_steps": progress.get("qc_done_steps", []),
+                "probes_done_steps": progress.get("probes_done_steps") or {},
+                "op_fail_counts": progress.get("op_fail_counts") or {},
+                "op_gave_up": progress.get("op_gave_up") or [],
+                "last_error": progress.get("last_error"),
+                "delivery_failures": recent_delivery_failures(progress),
                 "terminal_event": terminal_event,
             }
 

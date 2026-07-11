@@ -53,6 +53,94 @@ def test_run_digest_shows_giveups(monkeypatch, capsys):
     assert "qc_done=2" in out and "p1:1" in out and "probe:p1:3000" in out
 
 
+def test_run_digest_shows_fails_and_delivery_failures(monkeypatch, capsys):
+    env = {"ok": True, "data": {
+        "derived_status": "running", "container": {"running": True},
+        "latest_metrics": {"step": 5000, "loss": 1.0},
+        "progress": {"qc_done_steps": [1000],
+                     "op_fail_counts": {"qc:2000": 2},
+                     "delivery": {
+                         "qc:1000": {"status": 200},
+                         "probe:preview:1000": {"status": None,
+                                                "skipped_reason": "no_webhook"}}}}}
+    monkeypatch.setattr(rc, "_http", lambda *a, **k: env)
+    rc.command_remote(["--base-url", "http://x", "run", "proj", "r"])
+    out = capsys.readouterr().out
+    assert "fails={qc:2000:2}" in out
+    assert "delivery_failures:" in out and "no_webhook" in out
+    assert "qc:1000" not in out  # a delivered post is not a failure
+
+
+# ------------------------------------------------------------------- artifacts
+
+def test_artifacts_listing_terse_output(monkeypatch, capsys):
+    env = {"ok": True, "data": {
+        "entries": [
+            {"path": "checkpoints", "is_dir": True, "size": None, "mtime": 1.0},
+            {"path": "metrics.jsonl", "is_dir": False, "size": 2048, "mtime": 2.0}],
+        "total": 2, "truncated": False}}
+    calls = _capture_http(monkeypatch, env)
+    code = rc.command_remote(
+        ["--base-url", "http://x", "artifacts", "proj", "r", "--path", "qc", "--depth", "2"]
+    )
+    out = capsys.readouterr().out.strip().splitlines()
+    assert code == 0
+    assert calls["url"] == "http://x/v1/projects/proj/runs/r/artifacts?path=qc&depth=2"
+    assert out[0].startswith("d") and out[0].endswith("checkpoints")
+    assert "2048" in out[1] and out[1].endswith("metrics.jsonl")
+    assert out[2] == "total=2"
+
+
+def test_artifacts_file_prints_content(monkeypatch, capsys):
+    env = {"ok": True, "data": {
+        "binary": False, "truncated": False, "size": 12, "content": '{"step": 1}\n'}}
+    calls = _capture_http(monkeypatch, env)
+    code = rc.command_remote(
+        ["--base-url", "http://x", "artifacts", "proj", "r",
+         "--file", "qc/summary.json"]
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert out == '{"step": 1}\n'
+    assert calls["url"] == (
+        "http://x/v1/projects/proj/runs/r/artifacts/file"
+        "?path=qc%2Fsummary.json&max_bytes=65536&tail=false"
+    )
+
+
+def test_artifacts_file_binary_and_truncated_notes(monkeypatch, capsys):
+    env = {"ok": True, "data": {"binary": True, "size": 999, "content": None}}
+    _capture_http(monkeypatch, env)
+    rc.command_remote(
+        ["--base-url", "http://x", "artifacts", "proj", "r", "--file", "a.mp4"]
+    )
+    assert "binary size=999" in capsys.readouterr().out
+
+    env = {"ok": True, "data": {
+        "binary": False, "truncated": True, "tail": True, "size": 10_000_000,
+        "content": "tail text"}}
+    _capture_http(monkeypatch, env)
+    rc.command_remote(
+        ["--base-url", "http://x", "artifacts", "proj", "r",
+         "--file", "metrics.jsonl", "--tail", "--max-bytes", "4096"]
+    )
+    out = capsys.readouterr().out
+    assert "# truncated: last 4096 of 10000000 bytes" in out and "tail text" in out
+
+
+def test_artifacts_sandbox_error_surfaces(monkeypatch, capsys):
+    env = {"ok": False, "data": {},
+           "errors": [{"code": "run.artifact_path_forbidden",
+                       "message": "path escapes the run_dir"}]}
+    _capture_http(monkeypatch, env)
+    code = rc.command_remote(
+        ["--base-url", "http://x", "artifacts", "proj", "r", "--file", "../x"]
+    )
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "ERR run.artifact_path_forbidden" in out
+
+
 # ------------------------------------------------------------------ bundle-put
 
 def _bundle_dir(tmp_path, with_manifest=True):

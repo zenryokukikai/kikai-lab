@@ -192,6 +192,79 @@ def _gave_up(project_root: Path, run_id: str, progress: dict[str, Any], fail_key
 
 
 # --------------------------------------------------------------------------- #
+# delivery-outcome extraction (QC/probe op results -> progress["delivery"])
+# --------------------------------------------------------------------------- #
+# WHY: "the QC video rendered but never arrived on Discord" used to be
+# diagnosable only by ssh-reading the op's stdout on the host. QC/probe scripts
+# print one-line JSON events ({"event": "discord_post", "status": 200} /
+# {"event": "discord_post_skipped", "reason": ...}); the daemon now parses them
+# out of the op result it already holds and persists the outcome per step, so
+# the status API can answer delivery questions without host access.
+DELIVERY_EVENT_NAMES = frozenset({"discord_post", "discord_post_skipped"})
+
+
+def extract_delivery_events(result: Any) -> list[dict[str, Any]]:
+    """Every delivery event found in an op result, in execution order.
+
+    Covers both delivery channels: JSON event lines on any captured ``stdout``
+    (operation_sequence nests per-step results — recurse), and the daemon's own
+    ``artifact_delivery`` adapter result (``http_status``, no stdout event)."""
+    events: list[dict[str, Any]] = []
+    if isinstance(result, dict):
+        if result.get("execution_status") == "artifact_delivery_completed":
+            status = result.get("http_status")
+            events.append(
+                {"event": "discord_post", "status": status if isinstance(status, int) else None}
+            )
+        stdout = result.get("stdout")
+        if isinstance(stdout, str):
+            for line in stdout.splitlines():
+                stripped = line.strip()
+                if not stripped.startswith("{"):
+                    continue
+                try:
+                    row = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and row.get("event") in DELIVERY_EVENT_NAMES:
+                    events.append(row)
+        for key, value in result.items():
+            if key != "stdout":
+                events.extend(extract_delivery_events(value))
+    elif isinstance(result, list):
+        for item in result:
+            events.extend(extract_delivery_events(item))
+    return events
+
+
+def delivery_entry(result: Any) -> dict[str, Any]:
+    """One ``progress['delivery']`` record for an executed QC/probe op.
+
+    The LAST event wins (a multi-post op is summarized by its final post). No
+    event at all is recorded as ``no_delivery_event`` — that absence is exactly
+    the "generated but never posted" signal the status API needs to expose."""
+    events = extract_delivery_events(result)
+    if not events:
+        return {"status": None, "skipped_reason": "no_delivery_event"}
+    last = events[-1]
+    if last.get("event") == "discord_post_skipped":
+        return {"status": None, "skipped_reason": str(last.get("reason") or "skipped")}
+    status = last.get("status")
+    return {"status": status if isinstance(status, int) else None}
+
+
+def record_delivery(progress: dict[str, Any], key: str, result: Any) -> None:
+    """Persist one delivery outcome under the op's fail-key (``qc:<step>`` /
+    ``probe:<id>:<step>`` — same vocabulary as op_fail_counts, so the two maps
+    join naturally). FAIL-SAFE by contract: a parsing surprise must never break
+    the reconciliation that just succeeded."""
+    try:
+        progress.setdefault("delivery", {})[key] = delivery_entry(result)
+    except Exception:  # noqa: BLE001 — diagnostics must never break reconciliation
+        logging.getLogger("kikai_lab.reconcile").exception("delivery record failed")
+
+
+# --------------------------------------------------------------------------- #
 # serve heartbeat — externally visible daemon state (managed_runs/_serve_state.json)
 # --------------------------------------------------------------------------- #
 # WHY: a wedged/slow op used to freeze the daemon with NO externally visible
@@ -1120,8 +1193,9 @@ def tick(
         # so a genuine replay still raises _record_exists -> idempotent success below).
         _clear_incomplete_qc_record(project_root, qc_op)
         already_recorded = False
+        qc_result: dict[str, Any] | None = None
         try:
-            execute(qc_op)
+            qc_result = execute(qc_op)
         except OperationError as exc:
             if exc.code.endswith("_record_exists"):
                 # only COMPLETED records survive the clear above -> genuinely delivered.
@@ -1148,6 +1222,7 @@ def tick(
         done_steps.add(step)
         progress["qc_done_steps"] = sorted(done_steps)
         if not already_recorded:
+            record_delivery(progress, f"qc:{step}", qc_result)
             summary["new_qc_steps"].append(step)
             try:
                 # NB: a crash after QC delivery but before this append loses the rows
@@ -1197,8 +1272,9 @@ def tick(
                                     fail_key=f"probe:{probe_id}:{step}")
                 continue
             _clear_incomplete_qc_record(project_root, probe_op)
+            probe_result: dict[str, Any] | None = None
             try:
-                execute(probe_op)
+                probe_result = execute(probe_op)
             except OperationError as exc:
                 if exc.code.endswith("_record_exists"):
                     pass
@@ -1225,6 +1301,8 @@ def tick(
                 continue
             p_done.add(step)
             new_for_probe.append(step)
+            if probe_result is not None:  # None = idempotent replay; nothing new posted
+                record_delivery(progress, f"probe:{probe_id}:{step}", probe_result)
             probes_done_all[probe_id] = sorted(p_done)
             write_progress(project_root, run_id, progress)
         if new_for_probe:

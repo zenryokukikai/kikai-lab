@@ -286,12 +286,14 @@ def create_app(config: ServerConfig) -> FastAPI:
     from kikai_lab.server.bundles import build_bundles_router
     from kikai_lab.server.projects import build_projects_router
     from kikai_lab.server.resources import build_resources_router
+    from kikai_lab.server.run_files import build_run_files_router
     from kikai_lab.server.runs import build_runs_router
     from kikai_lab.server.submit import build_submit_router
 
     app.include_router(build_projects_router(config), prefix="/v1")
     app.include_router(build_resources_router(config), prefix="/v1")
     app.include_router(build_runs_router(config), prefix="/v1")
+    app.include_router(build_run_files_router(config), prefix="/v1")
     app.include_router(build_artifacts_router(config), prefix="/v1")
     app.include_router(build_bundles_router(config), prefix="/v1")
     app.include_router(build_submit_router(config), prefix="/v1")

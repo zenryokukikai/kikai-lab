@@ -30,6 +30,23 @@ pre-1.0, so minor versions may contain breaking API changes.
   `tarfile` — no macOS AppleDouble/`.DS_Store`/`__MACOSX` junk — and uploads
   it), `container-put` (PUT a container record from a JSON/YAML file), and
   `qc-config` (live probes/qc_op update from a JSON file).
+- **Run-dir inspection API (ssh-free)**: `GET .../runs/{run}/artifacts`
+  lists files/dirs inside the run_dir (path/size/mtime/is_dir; client paths
+  are sandboxed — traversal and symlink escapes are refused), and
+  `GET .../runs/{run}/artifacts/file?path=...&max_bytes=...` returns small
+  text/JSON content (`tail=true` for file tails; binary files return
+  metadata only). CLI: `kikai remote artifacts <project> <run>
+  [--path d --depth N | --file rel --tail]`.
+- `GET .../runs/{run}/status` now exposes the full reconciler progress
+  digest: `probes_done_steps`, `op_fail_counts`, `op_gave_up`, `last_error`,
+  and recent `delivery_failures`.
+- Delivery-outcome recording: after each QC/probe op the reconciler parses
+  `{"event": "discord_post", "status": N}` / `discord_post_skipped` events
+  from the op's captured stdout (and `artifact_delivery` step results) into
+  `progress.delivery`, keyed like `op_fail_counts` (`qc:<step>` /
+  `probe:<id>:<step>`) — "the video rendered but never arrived" is now
+  diagnosable from the API. Extraction is fail-safe: a parsing surprise
+  never breaks reconciliation.
 - Run conclusions (verdict + evidence) recorded with the run.
 - Declarative `evaluations` / `metric_checks` run by the reconciler, with
   gate-failure notifications.
