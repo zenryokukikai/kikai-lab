@@ -53,12 +53,16 @@ curl -X PUT $BASE/projects/example_proj/data-sources/example_manifest \
   "host_ref": "local", "roles": ["train_manifest"], "summary": "example manifest"}'
 curl -X POST $BASE/projects/example_proj/data-sources/example_manifest/verify
 # 4. container profile (docker.name/image/mounts; no live-worktree mounts allowed)
+#    CLI form (no heredoc quoting; --file takes .json or .yaml):
+#      kikai remote container-put example_proj example_training --file container.json
 curl -X PUT $BASE/projects/example_proj/containers/example_training \
   -H 'content-type: application/json' -d '{"docker": {"name": "example-training",
   "image": "example-image:latest"}, "mounts": [{"source": "env:HOST_RUNS_ROOT",
   "target": "env:CONTAINER_RUNS_ROOT", "mode": "rw"}]}'
 # 5. bundle: tar your scripts + a kikai_bundle.json manifest at tar root:
 #    {"entrypoints": {"train": {"argv": ["python", "scripts/train.py"]}}}
+#    CLI form — tars the directory itself (excludes macOS ._*/.DS_Store junk):
+#      kikai remote bundle-put example_proj example_trainer_v1 --dir ./bundle_src
 curl -X PUT $BASE/projects/example_proj/bundles/example_trainer_v1 \
   -H 'content-type: application/x-tar' --data-binary @bundle.tar
 # 6. dry-run the submission (validates everything, launches nothing)
@@ -260,6 +264,8 @@ preview probe) is a registry edit, not a resubmit — and hand-editing
 `managed_runs/<run>.yaml` bypasses validation:
 
 ```bash
+# CLI form (body from a file — no inline-JSON quoting):
+#   kikai remote qc-config example_proj example_run_001 --file qc.json
 curl -X POST $BASE/projects/example_proj/runs/example_run_001/qc-config \
   -H 'content-type: application/json' \
   -d '{"probes": [{"id": "preview", "bundle_id": "...", "entrypoint": "...",

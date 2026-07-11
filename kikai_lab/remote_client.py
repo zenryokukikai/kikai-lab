@@ -16,16 +16,22 @@ Subcommands::
   kikai remote op <project> --file req.json          # run op; script events auto-extracted
   kikai remote submit-from <project> <run> <parent> --overrides-file f.json
   kikai remote stop <project> <run>
+  kikai remote bundle-put <project> <bundle> --dir d # tar a dir -> PUT bundle
+  kikai remote container-put <project> <id> --file f # PUT container record (json/yaml)
+  kikai remote qc-config <project> <run> --file f    # live probes/qc_op update
 """
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import re
 import sys
+import tarfile
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 EVENT_RE = re.compile(r'\{"event"[^\n]+')
@@ -39,11 +45,23 @@ def _base_url(args: argparse.Namespace) -> str:
 
 
 def _http(
-    method: str, url: str, body: dict[str, Any] | None = None, timeout: int = 600
+    method: str,
+    url: str,
+    body: dict[str, Any] | None = None,
+    timeout: int = 600,
+    *,
+    raw: bytes | None = None,
+    content_type: str = "application/json",
 ) -> dict[str, Any]:
-    data = json.dumps(body).encode("utf-8") if body is not None else None
+    """JSON envelope round-trip. ``raw`` sends a pre-encoded byte body instead
+    (e.g. a tar upload); ``content_type`` then names its media type."""
+    if raw is not None:
+        data: bytes | None = raw
+    else:
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        content_type = "application/json"
     req = urllib.request.Request(
-        url, data=data, method=method, headers={"Content-Type": "application/json"}
+        url, data=data, method=method, headers={"Content-Type": content_type}
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -207,6 +225,134 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0 if env.get("ok") else 1
 
 
+BUNDLE_MANIFEST_NAME = "kikai_bundle.json"
+# macOS junk that hand-rolled `tar` on a Mac smuggles into uploads: AppleDouble
+# resource forks (``._*``), Finder metadata, and the zip-era ``__MACOSX`` dir.
+_MACOS_JUNK_NAMES = {".DS_Store"}
+
+
+def _is_macos_junk(relative: Path) -> bool:
+    return (
+        "__MACOSX" in relative.parts
+        or relative.name.startswith("._")
+        or relative.name in _MACOS_JUNK_NAMES
+    )
+
+
+def _build_bundle_tar(directory: Path) -> tuple[bytes, int]:
+    """Tar every regular file under ``directory`` (paths relative to it),
+    excluding macOS junk. tarfile — not the ``tar`` binary — so no AppleDouble
+    members and no shell-quoting hazards."""
+    buf = io.BytesIO()
+    count = 0
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for p in sorted(directory.rglob("*")):
+            if not p.is_file() or p.is_symlink():
+                continue
+            relative = p.relative_to(directory)
+            if _is_macos_junk(relative):
+                continue
+            tar.add(p, arcname=relative.as_posix(), recursive=False)
+            count += 1
+    return buf.getvalue(), count
+
+
+def cmd_bundle_put(args: argparse.Namespace) -> int:
+    directory = Path(args.dir)
+    if not directory.is_dir():
+        raise SystemExit(f"not a directory: {directory}")
+    if not (directory / BUNDLE_MANIFEST_NAME).is_file():
+        raise SystemExit(
+            f"missing {BUNDLE_MANIFEST_NAME} at bundle root: {directory} "
+            '(e.g. {"entrypoints": {"train": {"argv": ["python", "train.py"]}}})'
+        )
+    body, n_files = _build_bundle_tar(directory)
+    if not n_files:
+        raise SystemExit(f"no files to upload under: {directory}")
+    env = _http(
+        "PUT",
+        f"{_base_url(args)}/v1/projects/{args.project}/bundles/{args.bundle_id}",
+        raw=body,
+        content_type="application/x-tar",
+        timeout=args.timeout,
+    )
+    if args.json:
+        return _print_json(env)
+    d = env.get("data") or {}
+    entrypoints = ",".join(sorted(d.get("entrypoints") or {})) or "-"
+    print(
+        f"ok={env.get('ok')} created={bool(d.get('created'))} "
+        f"files={d.get('file_count', '-')} entrypoints={entrypoints}"
+    )
+    if d.get("already_exists"):
+        print("already_exists=True (identical content; bundles are immutable)")
+    for line in _err_lines(env):
+        print(line)
+    return 0 if env.get("ok") else 1
+
+
+def _load_record_file(path: str) -> dict[str, Any]:
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    if path.endswith((".yaml", ".yml")):
+        import yaml
+
+        record = yaml.safe_load(text)
+    else:
+        try:
+            record = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"{path}: not parseable JSON ({exc})") from exc
+    if not isinstance(record, dict):
+        raise SystemExit(f"{path}: expected a JSON/YAML object at top level")
+    return record
+
+
+def cmd_container_put(args: argparse.Namespace) -> int:
+    record = _load_record_file(args.file)
+    env = _http(
+        "PUT",
+        f"{_base_url(args)}/v1/projects/{args.project}/containers/{args.container_id}",
+        record,
+    )
+    if args.json:
+        return _print_json(env)
+    d = env.get("data") or {}
+    outcome = next(
+        (k for k in ("created", "updated", "already_exists") if d.get(k)), "-"
+    )
+    print(f"ok={env.get('ok')} outcome={outcome}")
+    for line in _err_lines(env):
+        print(line)
+    return 0 if env.get("ok") else 1
+
+
+def cmd_qc_config(args: argparse.Namespace) -> int:
+    with open(args.file, encoding="utf-8") as f:
+        try:
+            body = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"{args.file}: not parseable JSON ({exc})") from exc
+    env = _http(
+        "POST",
+        f"{_base_url(args)}/v1/projects/{args.project}/runs/{args.run}/qc-config",
+        body,
+    )
+    if args.json:
+        return _print_json(env)
+    d = env.get("data") or {}
+    updated = ",".join(d.get("updated") or []) or "-"
+    removed = ",".join(d.get("removed") or [])
+    warnings = ",".join(str(w.get("code")) for w in env.get("warnings") or []) or "-"
+    summary = f"ok={env.get('ok')} updated={updated}"
+    if removed:
+        summary += f" removed={removed}"
+    print(f"{summary} warnings={warnings}")
+    for line in _err_lines(env):
+        print(line)
+    return 0 if env.get("ok") else 1
+
+
 def command_remote(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="kikai remote")
     p.add_argument("--base-url", default=None)
@@ -253,6 +399,28 @@ def command_remote(argv: list[str]) -> int:
     s.add_argument("project")
     s.add_argument("run")
     s.set_defaults(fn=cmd_stop)
+
+    s = sub.add_parser("bundle-put")
+    s.add_argument("project")
+    s.add_argument("bundle_id")
+    s.add_argument("--dir", required=True)
+    s.add_argument("--timeout", type=int, default=600)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_bundle_put)
+
+    s = sub.add_parser("container-put")
+    s.add_argument("project")
+    s.add_argument("container_id")
+    s.add_argument("--file", required=True)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_container_put)
+
+    s = sub.add_parser("qc-config")
+    s.add_argument("project")
+    s.add_argument("run")
+    s.add_argument("--file", required=True)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_qc_config)
 
     args = p.parse_args(argv)
     return int(args.fn(args))

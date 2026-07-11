@@ -25,6 +25,11 @@ pre-1.0, so minor versions may contain breaking API changes.
   submit-time validation of the merged record; the reconciler picks the new
   config up on its next tick.
 - `brief` and `journal` endpoints for one-call session resume.
+- `kikai remote` registry-write subcommands, so agents never hand-roll
+  `curl` + heredoc quoting: `bundle-put` (tars a directory with Python's
+  `tarfile` — no macOS AppleDouble/`.DS_Store`/`__MACOSX` junk — and uploads
+  it), `container-put` (PUT a container record from a JSON/YAML file), and
+  `qc-config` (live probes/qc_op update from a JSON file).
 - Run conclusions (verdict + evidence) recorded with the run.
 - Declarative `evaluations` / `metric_checks` run by the reconciler, with
   gate-failure notifications.
