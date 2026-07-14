@@ -18,6 +18,8 @@ Subcommands::
   kikai remote op <project> --file req.json          # run op; script events auto-extracted
   kikai remote submit-from <project> <run> <parent> --overrides-file f.json
   kikai remote stop <project> <run>
+  kikai remote bundles <project>                     # bundle list (ssh-free)
+  kikai remote bundle-get <project> <bundle>         # entrypoints/argv detail
   kikai remote bundle-put <project> <bundle> --dir d # tar a dir -> PUT bundle
   kikai remote container-put <project> <id> --file f # PUT container record (json/yaml)
   kikai remote qc-config <project> <run> --file f    # live probes/qc_op update
@@ -319,6 +321,42 @@ def _build_bundle_tar(directory: Path) -> tuple[bytes, int]:
     return buf.getvalue(), count
 
 
+def cmd_bundles(args: argparse.Namespace) -> int:
+    env = _http("GET", f"{_base_url(args)}/v1/projects/{args.project}/bundles", None)
+    if args.json:
+        return _print_json(env)
+    d = env.get("data") or {}
+    for b in d.get("bundles") or []:
+        print(
+            f"{b.get('bundle_id')} files={b.get('file_count')} "
+            f"entrypoints={','.join(b.get('entrypoints') or [])}"
+        )
+    print(f"total={d.get('total')}")
+    for line in _err_lines(env):
+        print(line)
+    return 0 if env.get("ok") else 1
+
+
+def cmd_bundle_get(args: argparse.Namespace) -> int:
+    env = _http(
+        "GET",
+        f"{_base_url(args)}/v1/projects/{args.project}/bundles/{args.bundle_id}",
+        None,
+    )
+    if args.json:
+        return _print_json(env)
+    d = env.get("data") or {}
+    manifest = d.get("bundle") or {}
+    eps = manifest.get("entrypoints") or {}
+    print(f"bundle={args.bundle_id} files={len(manifest.get('files') or [])}")
+    for name, ep in sorted(eps.items()):
+        argv = ep.get("argv") if isinstance(ep, dict) else ep
+        print(f"  {name}: {' '.join(argv) if isinstance(argv, list) else argv}")
+    for line in _err_lines(env):
+        print(line)
+    return 0 if env.get("ok") else 1
+
+
 def cmd_bundle_put(args: argparse.Namespace) -> int:
     directory = Path(args.dir)
     if not directory.is_dir():
@@ -472,6 +510,17 @@ def command_remote(argv: list[str]) -> int:
     s.add_argument("project")
     s.add_argument("run")
     s.set_defaults(fn=cmd_stop)
+
+    s = sub.add_parser("bundles")
+    s.add_argument("project")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_bundles)
+
+    s = sub.add_parser("bundle-get")
+    s.add_argument("project")
+    s.add_argument("bundle_id")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_bundle_get)
 
     s = sub.add_parser("bundle-put")
     s.add_argument("project")
