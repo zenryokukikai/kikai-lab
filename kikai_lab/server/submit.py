@@ -1515,6 +1515,29 @@ def build_submit_router(config: ServerConfig) -> APIRouter:
             },
         )
 
+    # Training entrypoints launched as raw detached ops bypass the managed-run
+    # machinery entirely: no run record, no per-checkpoint QC/delivery, no
+    # retention protection, and the inspect API cannot see them (2026-07-14
+    # incident: a detached "train" op ran to completion with zero Discord QC).
+    # The escape hatch therefore refuses them; the submit-from path executes
+    # in-process and never passes through this route.
+    MANAGED_REQUIRED_ENTRYPOINTS = {"train", "stageb"}
+
+    def _reject_unmanaged_training_op(request: dict[str, Any]) -> None:
+        if request.get("adapter") not in ("script_bundle_run", "script_bundle_exec"):
+            return
+        if not request.get("detach"):
+            return
+        entrypoint = str(request.get("entrypoint") or "")
+        if entrypoint in MANAGED_REQUIRED_ENTRYPOINTS:
+            raise OperationError(
+                "operation.training_requires_managed_run",
+                "detached training entrypoints must be launched as managed runs "
+                "(kikai remote submit-from), not raw operations — raw launches "
+                "get no QC cadence, retention protection, or run inspection",
+                {"entrypoint": entrypoint},
+            )
+
     @router.post("/projects/{project_id}/operations")
     def operations_escape_hatch(
         project_id: str,
@@ -1535,6 +1558,7 @@ def build_submit_router(config: ServerConfig) -> APIRouter:
                 {},
             )
         request = {**request, "project_root": str(path)}
+        _reject_unmanaged_training_op(request)
         operation_name = str(request.get("operation") or "operation")
         op = {"kind": "kikai_operation", "schema_version": 1, "request": request}
         sha = request_sha256(op)

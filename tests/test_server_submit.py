@@ -287,6 +287,56 @@ def test_operations_escape_hatch_noop_and_project_root_pinning(tmp_path: Path) -
     assert bad.status_code == 422
 
 
+def test_operations_escape_hatch_rejects_detached_training_entrypoints(tmp_path: Path) -> None:
+    """Raw detached train/stageb ops bypass managed-run QC/retention/inspection —
+    the escape hatch must refuse them and point at submit-from (2026-07-14)."""
+    client = make_client(tmp_path)
+    put_project(client, "example_new")
+
+    r = client.post(
+        "/v1/projects/example_new/operations",
+        json={
+            "adapter": "script_bundle_run",
+            "operation": "rogue_train",
+            "bundle_id": "example_trainer_v1",
+            "container_id": "example_container",
+            "entrypoint": "train",
+            "detach": True,
+        },
+    )
+    assert r.status_code != 200
+    assert "training_requires_managed_run" in r.text
+
+    # non-detached (synchronous) training entrypoints stay allowed (smoke usage),
+    # as do detached NON-training entrypoints.
+    r2 = client.post(
+        "/v1/projects/example_new/operations",
+        params={"dry_run": "true"},
+        json={
+            "adapter": "script_bundle_run",
+            "operation": "smoke_train",
+            "bundle_id": "example_trainer_v1",
+            "container_id": "example_container",
+            "entrypoint": "train",
+            "detach": False,
+        },
+    )
+    assert r2.status_code == 200, r2.text
+    r3 = client.post(
+        "/v1/projects/example_new/operations",
+        params={"dry_run": "true"},
+        json={
+            "adapter": "script_bundle_run",
+            "operation": "regen_job",
+            "bundle_id": "example_trainer_v1",
+            "container_id": "example_container",
+            "entrypoint": "regen",
+            "detach": True,
+        },
+    )
+    assert r3.status_code == 200, r3.text
+
+
 def test_background_reconciler_pass_and_healthz(tmp_path: Path) -> None:
     from fastapi.testclient import TestClient
 
