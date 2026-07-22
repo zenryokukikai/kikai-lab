@@ -1797,7 +1797,7 @@ def ephemeral_child_name_regex(
     # which shifts both the [:50] suffix cut and the base truncation. Build one
     # alternative per plausible digit count so every width matches exactly.
     alternatives = []
-    for digits in range(6, 10):
+    for digits in range(6, 12):
         prefix_len = 4 + digits + 2  # "step" + digits + "__"
         safe_suffix_len = min(prefix_len + len(safe_tag), 50)
         kept_tag = safe_tag[: max(0, safe_suffix_len - prefix_len)]

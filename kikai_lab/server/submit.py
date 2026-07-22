@@ -798,8 +798,12 @@ def build_submit_router(config: ServerConfig) -> APIRouter:
                 # force_finalize=true would cancel the new run's backfill and
                 # finalize it the moment training exits. Mirror of the run_dir
                 # control cleanup below, on the managed_runs side.
-                (path / "managed_runs" / f"{run_name}.progress.json").unlink(missing_ok=True)
-                (path / "managed_runs" / f"{run_name}.control.json").unlink(missing_ok=True)
+                # NOT on retry: a retry is the SAME life — the daemon may already
+                # have ticked the crashed-mid-launch container and accumulated
+                # qc_done_steps; unlinking would re-QC (duplicate deliveries).
+                if not is_retry:
+                    (path / "managed_runs" / f"{run_name}.progress.json").unlink(missing_ok=True)
+                    (path / "managed_runs" / f"{run_name}.control.json").unlink(missing_ok=True)
                 managed_created = True
 
         adopted = False
@@ -1569,18 +1573,23 @@ def build_submit_router(config: ServerConfig) -> APIRouter:
             with WRITE_LOCK:
                 control = read_control(path, run_name)
                 control["force_finalize"] = False
+                control.pop("force_finalize_requested_at", None)
                 atomic_write_json(control_path(path, run_name), control)
             append_journal(path, "run_force_finalize_cancelled", {"run_name": run_name})
+            # best-effort: a daemon tick that already consumed the request may
+            # finalize regardless — already_finalized reflects the pre-cancel read
             return envelope_response(
                 ok=True,
                 data={"run_name": run_name, "finalize_requested": False,
-                      "cancelled": True, "already_finalized": already},
+                      "cancelled": True, "best_effort": True,
+                      "already_finalized": already},
             )
         if not already:
             with WRITE_LOCK:
                 control = read_control(path, run_name)
+                if not control.get("force_finalize"):
+                    control["force_finalize_requested_at"] = utc_now_text()
                 control["force_finalize"] = True
-                control.setdefault("force_finalize_requested_at", utc_now_text())
                 atomic_write_json(control_path(path, run_name), control)
 
         # Immediately remove RUNNING step-suffixed children of this run's

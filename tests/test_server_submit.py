@@ -331,6 +331,7 @@ def test_ephemeral_child_name_regex_matches_composed_names() -> None:
         ("name", "probe_weird id/slash", 31000),                 # mangled chars
         ("short-name", "probe_pv", 1_000_000),                   # step{:06d} is a MINIMUM
         ("x" * 60, "probe_preview1080", 123_456_789),            # 9 digits + truncation
+        ("short-name", "probe_pv", 99_999_999_999),              # 11 digits
     ]
     for declared, tag, step in cases:
         container = {"docker": {"name": declared, "ephemeral": True}}
@@ -464,6 +465,59 @@ def test_resubmit_clears_stale_progress_and_control(tmp_path: Path, monkeypatch)
     assert response.status_code == 201, response.text
     assert not (project / "managed_runs" / "example_run_a.progress.json").exists()
     assert not (project / "managed_runs" / "example_run_a.control.json").exists()
+
+
+def test_retry_submit_preserves_live_progress(tmp_path: Path, monkeypatch) -> None:
+    """A retry of a crashed-mid-launch submit is the SAME run life: the daemon
+    may already have accumulated qc_done_steps for the (adopted) container —
+    unlinking progress there would re-QC every checkpoint (duplicate posts)."""
+    client = make_client(tmp_path)
+    prepare_project(tmp_path, client)
+    fake, _, _ = write_fake_docker(tmp_path)
+    monkeypatch.setenv("KIKAI_DOCKER_BIN", str(fake))
+    set_container_env(monkeypatch, tmp_path)
+    project = tmp_path / "example_new"
+
+    first = submit(client)
+    assert first.status_code == 201
+    # simulate the crash-mid-launch state that makes the same submit retryable
+    run_path = project / "runs" / "example_run_a.yaml"
+    record = yaml.safe_load(run_path.read_text())
+    record["status"] = "submitting"
+    run_path.write_text(yaml.safe_dump(record))
+    live = {"run_id": "example_run_a", "qc_done_steps": [1000, 2000], "seen_running": True}
+    (project / "managed_runs" / "example_run_a.progress.json").write_text(json.dumps(live))
+
+    retry = submit(client)
+    assert retry.status_code in (200, 201), retry.text
+    kept = json.loads((project / "managed_runs" / "example_run_a.progress.json").read_text())
+    assert kept["qc_done_steps"] == [1000, 2000]
+
+
+def test_finalize_cancel_clears_request_timestamp(tmp_path: Path, monkeypatch) -> None:
+    client = make_client(tmp_path)
+    prepare_project(tmp_path, client)
+    fake, _, _ = write_fake_docker(tmp_path)
+    monkeypatch.setenv("KIKAI_DOCKER_BIN", str(fake))
+    set_container_env(monkeypatch, tmp_path)
+    submit(client)
+    project = tmp_path / "example_new"
+    control_file = project / "managed_runs" / "example_run_a.control.json"
+
+    client.post("/v1/projects/example_new/runs/example_run_a/finalize")
+    first_ts = json.loads(control_file.read_text())["force_finalize_requested_at"]
+    cancelled = client.post(
+        "/v1/projects/example_new/runs/example_run_a/finalize", params={"cancel": "true"}
+    )
+    assert cancelled.json()["data"]["cancelled"] is True
+    control = json.loads(control_file.read_text())
+    assert control["force_finalize"] is False
+    assert "force_finalize_requested_at" not in control
+    # a re-request records ITS OWN timestamp, not the cancelled one's
+    client.post("/v1/projects/example_new/runs/example_run_a/finalize")
+    control = json.loads(control_file.read_text())
+    assert control["force_finalize"] is True
+    assert control["force_finalize_requested_at"] >= first_ts
 
 
 def test_project_containers_lists_only_kikai_managed(tmp_path: Path, monkeypatch) -> None:
