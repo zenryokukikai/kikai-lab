@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# kk — kikai CLI wrapper with cwd + environment baked in.
+#
+# Repeating `cd <checkout> && KIKAI_SERVER_URL=... uv run kikai ...` for every
+# call is boilerplate (and a wrong-cwd `uv run` fails with "Failed to spawn:
+# kikai"). This wrapper resolves the checkout from its own location, loads
+# repo-local defaults from `.env` (gitignored — put e.g.
+# KIKAI_SERVER_URL=http://myhost:8300 there), and forwards to `uv run kikai`.
+#
+#   bin/kk remote ps <project>
+#   bin/kk r ps <project>          # "r" = shorthand for "remote"
+set -euo pipefail
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+if [ -f "$ROOT/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$ROOT/.env"
+  set +a
+fi
+cd "$ROOT"
+if [ "${1:-}" = "r" ]; then
+  shift
+  set -- remote "$@"
+fi
+exec uv run kikai "$@"
