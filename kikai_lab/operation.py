@@ -1983,6 +1983,60 @@ def docker_rm_force(request: dict[str, Any], container_name: str) -> None:
         ) from exc
 
 
+def docker_ps_all(request: dict[str, Any]) -> list[dict[str, Any]]:
+    """Local ``docker ps -a`` as parsed rows (name/state/status/image/running_for).
+
+    The pipe-delimited --format mirrors execute_remote_docker_teardown_operation's
+    remote listing so both surfaces describe containers identically.
+    """
+    fmt = "{{.Names}}|{{.State}}|{{.Status}}|{{.Image}}|{{.RunningFor}}"
+    command = [os.environ.get("KIKAI_DOCKER_BIN", "docker"), "ps", "-a", "--format", fmt]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            capture_output=True,
+            env=docker_subprocess_env(request),
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise OperationError(
+            "operation.docker_ps_timeout",
+            "docker ps did not return within 60s (docker daemon wedged?)",
+            {},
+        ) from exc
+    except FileNotFoundError as exc:
+        raise OperationError(
+            "operation.docker_not_found",
+            "docker executable was not found",
+            {"docker_bin": command[0]},
+        ) from exc
+    if completed.returncode != 0:
+        raise OperationError(
+            "operation.docker_ps_failed",
+            "docker ps returned non-zero",
+            {"stderr": completed.stderr.strip()[:500]},
+        )
+    rows: list[dict[str, Any]] = []
+    for line in completed.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|", 4)
+        if len(parts) < 5:
+            continue
+        rows.append(
+            {
+                "name": parts[0],
+                "state": parts[1],
+                "status": parts[2],
+                "image": parts[3],
+                "running_for": parts[4],
+            }
+        )
+    return rows
+
+
 def tensorboard_args(port: int, logdir: str) -> list[str]:
     return [
         "sh",

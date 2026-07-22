@@ -47,6 +47,10 @@ def write_fake_docker(tmp_path: Path):
         "    control['exists'] = False\n"
         "    control_path.write_text(json.dumps(control))\n"
         "    raise SystemExit(0)\n"
+        "if cmd == 'ps':\n"
+        "    for row in control.get('ps_rows', []):\n"
+        "        print(row)\n"
+        "    raise SystemExit(0)\n"
         "raise SystemExit(0)\n",
         encoding="utf-8",
     )
@@ -257,6 +261,92 @@ def test_stop_is_idempotent(tmp_path: Path, monkeypatch) -> None:
 
     missing = client.post("/v1/projects/example_new/runs/example_absent/stop")
     assert missing.status_code == 404
+
+
+def test_run_finalize_stops_backfill_and_probe_containers(tmp_path: Path, monkeypatch) -> None:
+    client = make_client(tmp_path)
+    prepare_project(tmp_path, client)
+    fake, read_argv, set_control = write_fake_docker(tmp_path)
+    monkeypatch.setenv("KIKAI_DOCKER_BIN", str(fake))
+    set_container_env(monkeypatch, tmp_path)
+    submit(client)
+
+    project = tmp_path / "example_new"
+    managed_path = project / "managed_runs" / "example_run_a.yaml"
+    managed = yaml.safe_load(managed_path.read_text())
+    managed["probes"] = [
+        {"id": "pv", "container_id": "example_training", "every_steps": 1000,
+         "bundle_id": "example_trainer_v1", "entrypoint": "train", "args": []},
+    ]
+    managed_path.write_text(yaml.safe_dump(managed))
+    set_control(ps_rows=[
+        "example-training__step031000__probe_pv|running|Up 2 minutes|img:1|2 minutes",
+        "example-training__step031000__probe_other|running|Up 2 minutes|img:1|2 minutes",
+        "example-training|running|Up 1 hour|img:1|1 hour",
+    ])
+
+    response = client.post("/v1/projects/example_new/runs/example_run_a/finalize")
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["finalized"] is True
+    assert data["already_finalized"] is False
+    assert data["run_status"] == "completed"
+    # only THIS run's declared probe id is stopped — not other probes, not training
+    assert data["stopped_containers"] == ["example-training__step031000__probe_pv"]
+    assert any(a[:2] == ["rm", "-f"] and a[2].endswith("probe_pv") for a in read_argv())
+
+    progress = json.loads(
+        (project / "managed_runs" / "example_run_a.progress.json").read_text()
+    )
+    assert progress["finalized"] is True
+    assert progress["lifecycle_state"] == "done"
+    run_record = yaml.safe_load((project / "runs" / "example_run_a.yaml").read_text())
+    assert run_record["status"] == "completed"
+
+    # the reconciler tick short-circuits on finalized (no daemon restart needed)
+    from kikai_lab.reconcile import tick
+
+    summary = tick(project, managed, progress, execute=lambda op: {}, inspect=None)
+    assert summary["status"] == {"finalized": True}
+
+    again = client.post("/v1/projects/example_new/runs/example_run_a/finalize")
+    assert again.json()["data"]["already_finalized"] is True
+
+    missing = client.post("/v1/projects/example_new/runs/example_absent/finalize")
+    assert missing.status_code == 404
+
+
+def test_project_containers_lists_only_kikai_managed(tmp_path: Path, monkeypatch) -> None:
+    client = make_client(tmp_path)
+    prepare_project(tmp_path, client)
+    fake, _, set_control = write_fake_docker(tmp_path)
+    monkeypatch.setenv("KIKAI_DOCKER_BIN", str(fake))
+    set_container_env(monkeypatch, tmp_path)
+    set_control(ps_rows=[
+        "example-training|running|Up 1 hour|img:1|1 hour",
+        "example-training__c0835sg|exited|Exited (0) 5 minutes ago|img:1|10 minutes",
+        "example-training__step031000__probe_pv|running|Up 2 minutes|img:1|2 minutes",
+        "example-training__step005000|running|Up 1 minute|img:1|1 minute",
+        "example-training__step007000__eval_gate|exited|Exited (0) 1 hour ago|img:1|2 hours",
+        "unrelated-user-container|running|Up 3 weeks|other:latest|3 weeks",
+    ])
+
+    response = client.get("/v1/projects/example_new/docker/ps")
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["count"] == 5  # unrelated container is not kikai's
+    by_name = {row["name"]: row for row in data["containers"]}
+    assert "unrelated-user-container" not in by_name
+    assert by_name["example-training"]["origin"] == {
+        "container_id": "example_training", "kind": "container"}
+    assert by_name["example-training__c0835sg"]["origin"] == {
+        "container_id": "example_training", "kind": "op", "suffix": "c0835sg"}
+    assert by_name["example-training__step031000__probe_pv"]["origin"] == {
+        "container_id": "example_training", "kind": "probe", "step": 31000, "probe_id": "pv"}
+    assert by_name["example-training__step005000"]["origin"] == {
+        "container_id": "example_training", "kind": "qc", "step": 5000}
+    assert by_name["example-training__step007000__eval_gate"]["origin"] == {
+        "container_id": "example_training", "kind": "evaluation", "step": 7000, "eval_id": "gate"}
 
 
 def test_operations_escape_hatch_noop_and_project_root_pinning(tmp_path: Path) -> None:
