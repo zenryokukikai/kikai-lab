@@ -25,6 +25,7 @@ from kikai_lab.operation import (
     docker_name_from_container,
     docker_ps_all,
     docker_rm_force,
+    ephemeral_child_name_regex,
     execute_operation,
     load_container_record,
     load_script_bundle,
@@ -33,6 +34,7 @@ from kikai_lab.operation import (
     resolve_text_ref,
     script_bundle_entrypoint_argv,
 )
+from kikai_lab.reconcile import control_path, progress_path, read_control
 from kikai_lab.server.app import envelope_response
 from kikai_lab.server.registry import (
     WRITE_LOCK,
@@ -790,6 +792,14 @@ def build_submit_router(config: ServerConfig) -> APIRouter:
                     path / "managed_runs" / f"{run_name}.yaml",
                     managed_run_record(run_name, body),
                 )
+                # A fresh submit must not inherit a previous life's daemon state:
+                # a stale progress.json finalized=true short-circuits every tick
+                # (no QC, no teardown, ever), and a stale control.json
+                # force_finalize=true would cancel the new run's backfill and
+                # finalize it the moment training exits. Mirror of the run_dir
+                # control cleanup below, on the managed_runs side.
+                (path / "managed_runs" / f"{run_name}.progress.json").unlink(missing_ok=True)
+                (path / "managed_runs" / f"{run_name}.control.json").unlink(missing_ok=True)
                 managed_created = True
 
         adopted = False
@@ -1517,20 +1527,25 @@ def build_submit_router(config: ServerConfig) -> APIRouter:
         )
 
     @router.post("/projects/{project_id}/runs/{run_name}/finalize")
-    def run_finalize(project_id: str, run_name: str) -> JSONResponse:
-        """Force-finalize a managed run: stop QC/probe backfill permanently.
+    def run_finalize(
+        project_id: str, run_name: str, cancel: bool = Query(False)
+    ) -> JSONResponse:
+        """Request force-finalize: cancel the QC/probe backfill and finalize.
 
-        A run whose training exited with a large probe backlog keeps backfilling
-        for hours (issue #13) — qc-config probes=[] does not stop in-flight work,
-        and the only recourse was hand-editing progress.json over ssh plus a
-        daemon restart. This endpoint does the whole thing in one call:
-        1. progress: finalized=true + lifecycle_state=done (the reconciler tick
-           short-circuits on `finalized`, so no daemon restart is needed)
-        2. run record: a non-terminal status is closed out as `completed`
-        3. running probe/eval containers OF THIS RUN are removed (matched by the
-           step-suffix naming `<base>__stepNNNNNN__probe_<id>` for this run's
-           declared probe/eval ids; bare qc containers are left to finish their
-           current render — they cannot be attributed to a run by name alone)
+        The server does NOT write progress.json — the reconciler daemon owns it,
+        and a second writer means a mid-tick force request gets clobbered by the
+        tick's stale write-back (last-writer-wins). Instead the request goes
+        into managed_runs/<run>.control.json (the server is its only writer);
+        the daemon re-reads it before each backfill op, cancels the remaining
+        backlog, and runs its REGULAR terminal block — teardown, finalize
+        notification, on_finalize evaluations, checkpoint ledger — none of
+        which a server-side imitation could safely reproduce. Running
+        probe/eval containers of this run are removed immediately, matched with
+        the same truncation/mangling their runtime names actually got.
+        A still-running training container is NOT killed by this endpoint (POST
+        .../stop first); until it exits, its QC keeps running and the request
+        stays pending. on_finalize evaluations DO run as part of the regular
+        closure. `?cancel=true` withdraws a pending request.
         """
         path = require_project(config, project_id)
         run_name = require_safe_id(run_name, kind="run")
@@ -1541,33 +1556,38 @@ def build_submit_router(config: ServerConfig) -> APIRouter:
                 "finalize requires a managed run (managed_runs/<run>.yaml)",
                 {"run_name": run_name},
             )
-        progress_file = path / "managed_runs" / f"{run_name}.progress.json"
         progress: dict[str, Any] = {}
+        progress_file = progress_path(path, run_name)
         if progress_file.is_file():
             try:
-                progress = json.loads(progress_file.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
+                loaded = json.loads(progress_file.read_text(encoding="utf-8"))
+                progress = loaded if isinstance(loaded, dict) else {}
+            except (OSError, json.JSONDecodeError):
                 progress = {}
         already = bool(progress.get("finalized"))
-        progress["finalized"] = True
-        progress["lifecycle_state"] = "done"
-        progress.setdefault("run_id", run_name)
+        if cancel:
+            with WRITE_LOCK:
+                control = read_control(path, run_name)
+                control["force_finalize"] = False
+                atomic_write_json(control_path(path, run_name), control)
+            append_journal(path, "run_force_finalize_cancelled", {"run_name": run_name})
+            return envelope_response(
+                ok=True,
+                data={"run_name": run_name, "finalize_requested": False,
+                      "cancelled": True, "already_finalized": already},
+            )
         if not already:
-            progress["force_finalized_at"] = utc_now_text()
-        atomic_write_json(progress_file, progress)
+            with WRITE_LOCK:
+                control = read_control(path, run_name)
+                control["force_finalize"] = True
+                control.setdefault("force_finalize_requested_at", utc_now_text())
+                atomic_write_json(control_path(path, run_name), control)
 
-        run_path = path / "runs" / f"{run_name}.yaml"
-        run_status = None
-        if run_path.is_file():
-            record = load_yaml_record(run_path, kind="run")
-            run_status = record.get("status")
-            if run_status in (None, "running", "pending", "exited_pending_finalize"):
-                record["status"] = "completed"
-                atomic_write_yaml(run_path, record)
-                run_status = "completed"
-
-        # step-suffixed children of this run's probe/eval declarations
-        suffix_ids: list[tuple[str, str]] = []  # (kind, id)
+        # Immediately remove RUNNING step-suffixed children of this run's
+        # probe/eval declarations (the current in-flight render). Bare qc
+        # containers (`<base>__stepNNNNNN`) carry no per-run tag and are left
+        # to finish; the cancelled backlog stops any further ones.
+        suffix_ids: list[tuple[str, str]] = []  # (tag, container_id)
         for probe in managed.get("probes") or []:
             pid = str(probe.get("id") or "")
             cid = str(probe.get("container_id") or "")
@@ -1584,37 +1604,40 @@ def build_submit_router(config: ServerConfig) -> APIRouter:
                 suffix_ids.append((f"eval_{eid}", cid))
         request = {"project_root": str(path)}
         stopped: list[str] = []
-        if suffix_ids:
-            patterns = []
-            for tag, cid in suffix_ids:
-                try:
-                    container = load_container_record(path, cid)
-                    base = resolve_text_ref(docker_name_from_container(container, cid))
-                except OperationError:
+        patterns = []
+        for tag, cid in suffix_ids:
+            try:
+                container = load_container_record(path, cid)
+            except OperationError:
+                continue
+            pattern = ephemeral_child_name_regex(container, cid, tag)
+            if pattern is not None:
+                patterns.append(pattern)
+        # reap even when already finalized — a leftover child rendering after
+        # teardown is exactly what an operator re-POSTs finalize to remove
+        if patterns:
+            for row in docker_ps_all(request):
+                if row.get("state") != "running":
                     continue
-                patterns.append(re.compile(rf"^{re.escape(base)}__step\d+__{re.escape(tag)}$"))
-            if patterns:
-                for row in docker_ps_all(request):
-                    if row.get("state") != "running":
-                        continue
-                    name = row["name"]
-                    if any(p.match(name) for p in patterns):
-                        docker_rm_force(request, name)
-                        stopped.append(name)
+                name = row["name"]
+                if any(p.match(name) for p in patterns):
+                    docker_rm_force(request, name)
+                    stopped.append(name)
         append_journal(
             path,
-            "run_force_finalized",
+            "run_force_finalize_requested",
             {"run_name": run_name, "stopped_containers": stopped, "already_finalized": already},
         )
         return envelope_response(
             ok=True,
             data={
                 "run_name": run_name,
-                "finalized": True,
+                "finalize_requested": True,
                 "already_finalized": already,
-                "run_status": run_status,
                 "stopped_containers": stopped,
-                "note": "reconciler skips this run from its next tick (no restart needed)",
+                "note": "reconciler cancels the remaining backfill and runs its "
+                        "regular terminal block (teardown/notify/evals/ledger) on "
+                        "its next tick — no daemon restart needed",
             },
         )
 
@@ -1622,19 +1645,22 @@ def build_submit_router(config: ServerConfig) -> APIRouter:
     def project_docker_ps(project_id: str) -> JSONResponse:
         """ssh-free `docker ps` scoped to this project's kikai-managed containers.
 
-        Rows are docker containers whose name equals a registered container
-        record's docker name or extends it with the `__<suffix>` convention
-        (ephemeral ops, `__stepNNNNNN` qc, `__stepNNNNNN__probe_<id>` probes,
-        `__stepNNNNNN__eval_<id>` evaluations). Anything else on the host is
-        not kikai's and is not reported.
+        Attribution is label-first: containers launched by kikai carry
+        `kikai.container_id` / `kikai.suffix` labels (docker_attribution_labels),
+        which survive any change to the name convention and any --name
+        truncation. Containers from before the labels existed fall back to name
+        matching against each registered record's docker name + `__<suffix>`
+        convention. Anything not attributable is not kikai's and not reported.
         """
         path = require_project(config, project_id)
         request = {"project_root": str(path)}
         bases: list[tuple[str, str]] = []  # (docker base name, container_id)
+        known_ids: set[str] = set()
         containers_dir = path / "containers"
         if containers_dir.is_dir():
             for cpath in sorted(containers_dir.glob("*.yaml")):
                 cid = cpath.stem
+                known_ids.add(cid)
                 try:
                     record = load_container_record(path, cid)
                     base = resolve_text_ref(docker_name_from_container(record, cid))
@@ -1643,30 +1669,37 @@ def build_submit_router(config: ServerConfig) -> APIRouter:
                 bases.append((base, cid))
         # longest base first so `foo-bar` wins over `foo` for name `foo-bar__x`
         bases.sort(key=lambda item: len(item[0]), reverse=True)
+
+        def classify(cid: str, suffix: str) -> dict[str, Any]:
+            origin: dict[str, Any] = {"container_id": cid, "kind": "container"}
+            if (m := re.match(r"^step(\d+)__probe_(.+)$", suffix)):
+                origin.update(kind="probe", step=int(m.group(1)), probe_id=m.group(2))
+            elif (m := re.match(r"^step(\d+)__eval_(.+)$", suffix)):
+                origin.update(kind="evaluation", step=int(m.group(1)), eval_id=m.group(2))
+            elif (m := re.match(r"^step(\d+)$", suffix)):
+                origin.update(kind="qc", step=int(m.group(1)))
+            elif suffix:
+                origin.update(kind="op", suffix=suffix)
+            return origin
+
         out: list[dict[str, Any]] = []
         for row in docker_ps_all(request):
             name = row["name"]
-            match = next(
-                ((base, cid) for base, cid in bases
-                 if name == base or name.startswith(base + "__")),
-                None,
-            )
-            if not match:
-                continue
-            base, cid = match
-            suffix = name[len(base) + 2:] if name != base else ""
-            origin: dict[str, Any] = {"container_id": cid, "kind": "container"}
-            m = re.match(r"^step(\d+)__probe_(.+)$", suffix)
-            if m:
-                origin = {"container_id": cid, "kind": "probe",
-                          "step": int(m.group(1)), "probe_id": m.group(2)}
-            elif (m := re.match(r"^step(\d+)__eval_(.+)$", suffix)):
-                origin = {"container_id": cid, "kind": "evaluation",
-                          "step": int(m.group(1)), "eval_id": m.group(2)}
-            elif (m := re.match(r"^step(\d+)$", suffix)):
-                origin = {"container_id": cid, "kind": "qc", "step": int(m.group(1))}
-            elif suffix:
-                origin = {"container_id": cid, "kind": "op", "suffix": suffix}
+            labels = row.get("labels") or {}
+            label_cid = labels.get("kikai.container_id")
+            if label_cid and label_cid in known_ids:
+                origin = classify(label_cid, labels.get("kikai.suffix") or "")
+            else:
+                match = next(
+                    ((base, cid) for base, cid in bases
+                     if name == base or name.startswith(base + "__")),
+                    None,
+                )
+                if not match:
+                    continue
+                base, cid = match
+                origin = classify(cid, name[len(base) + 2:] if name != base else "")
+            row = {k: v for k, v in row.items() if k != "labels"}
             out.append({**row, "origin": origin})
         return envelope_response(ok=True, data={"containers": out, "count": len(out)})
 

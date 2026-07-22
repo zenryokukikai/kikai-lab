@@ -106,6 +106,25 @@ def progress_path(project_root: Path, run_id: str) -> Path:
     return managed_runs_dir(project_root) / f"{run_id}.progress.json"
 
 
+def control_path(project_root: Path, run_id: str) -> Path:
+    return managed_runs_dir(project_root) / f"{run_id}.control.json"
+
+
+def read_control(project_root: Path, run_id: str) -> dict[str, Any]:
+    """Operator requests written by the SERVER process (its only writer), read
+    fresh by the daemon before each backfill op. A separate file from
+    progress.json so the two processes never write the same file — a force
+    request can therefore never be clobbered by a tick's stale write-back."""
+    path = control_path(project_root, run_id)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def default_progress(run_id: str) -> dict[str, Any]:
     return {
         "run_id": run_id,
@@ -1163,6 +1182,22 @@ def tick(
     if status.get("running"):
         progress["seen_running"] = True
 
+    # Operator force-finalize request (control file, server-written). Re-read
+    # before each backfill op launch below: the request may land mid-tick, and
+    # a minutes-long backlog must not run to completion first. The request is
+    # only ACTIVE while the training container is verifiably not running —
+    # honoring it against a live training would silently disable all QC for
+    # the rest of the run, and an inspect error (docker unreachable) must not
+    # be mistaken for "exited" (mirrors the container_gone rule below).
+    training_inactive = (not status.get("running")) and (not status.get("inspect_error"))
+    force_finalize = bool(read_control(project_root, run_id).get("force_finalize"))
+
+    def _force_requested() -> bool:
+        nonlocal force_finalize
+        if not force_finalize:
+            force_finalize = bool(read_control(project_root, run_id).get("force_finalize"))
+        return force_finalize and training_inactive
+
     # 2. QC every new checkpoint exactly once (commit each step BEFORE the next -> no dup post)
     qc_configured = ("qc_op" in managed_run) or bool(managed_run.get("qc_op_template"))
     done_steps = set(progress.get("qc_done_steps", []))
@@ -1175,6 +1210,11 @@ def tick(
             continue
         if _gave_up(project_root, run_id, progress, f"qc:{step}"):
             continue
+        # fresh control read only when work is actually pending — an idle
+        # backlog must not cost O(steps) file reads per tick
+        if _force_requested():
+            summary["backfill_cancelled"] = "force_finalize"
+            break
         try:
             qc_op = build_qc_op(project_root, managed_run, step, path)
         except OperationError as exc:
@@ -1261,6 +1301,9 @@ def tick(
                 continue
             if _gave_up(project_root, run_id, progress, f"probe:{probe_id}:{step}"):
                 continue
+            if _force_requested():
+                summary["backfill_cancelled"] = "force_finalize"
+                break
             try:
                 probe_op = build_probe_op(project_root, managed_run, probe, step, cpath)
             except OperationError as exc:
@@ -1314,6 +1357,9 @@ def tick(
     all_steps = [s for s, _ in checkpoint_steps(run_dir)]
     summary["eval_errors"] = []
     for evaluation in evaluations:
+        if _force_requested():
+            summary["backfill_cancelled"] = "force_finalize"
+            break
         eval_id = str(evaluation.get("eval_id") or "")
         if not eval_id or not isinstance(evaluation.get("op"), dict):
             continue
@@ -1326,6 +1372,9 @@ def tick(
             progress["last_error"] = f"eval {eval_id}: {exc.code}"
             continue
         for step in due:
+            if _force_requested():
+                summary["backfill_cancelled"] = "force_finalize"
+                break  # outer loop exits via its own guard on the next probe
             try:
                 eval_op = build_evaluation_op(project_root, managed_run, evaluation, step)
             except OperationError as exc:
@@ -1516,8 +1565,25 @@ def tick(
     terminally_exited = bool(progress.get("seen_running")) and (
         (status.get("exists") and status.get("state") in ("exited", "dead")) or container_gone
     )
+    # Operator force-finalize: honored once the training container is not
+    # running (exited, dead, gone, or never seen) AND docker is reachable —
+    # an inspect error must not produce a premature finalize notification.
+    # The REGULAR terminal block below then runs — teardown, finalize
+    # notification, on_finalize evaluations, checkpoint ledger — instead of a
+    # thin server-side imitation. A still-running training refuses the
+    # shortcut (stop it explicitly first); its QC keeps running meanwhile.
+    if _force_requested() and not terminally_exited:
+        terminally_exited = True
+    elif force_finalize and not training_inactive and not progress.get("finalized"):
+        summary["force_finalize"] = (
+            "pending_docker_unreachable" if status.get("inspect_error")
+            else "pending_training_exit"
+        )
     if terminally_exited and not progress.get("finalized"):
-        reason = terminal_event or ("container_gone" if container_gone else "container_exited")
+        reason = terminal_event or (
+            "force_finalize" if force_finalize
+            else "container_gone" if container_gone else "container_exited"
+        )
         progress["lifecycle_state"] = "finalizing"
         if managed_run.get("delivery_target_id") and not progress.get("finalize_notified"):
             try:

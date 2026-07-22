@@ -292,9 +292,10 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 def cmd_finalize(args: argparse.Namespace) -> int:
+    query = "?cancel=true" if getattr(args, "cancel", False) else ""
     env = _http(
         "POST",
-        f"{_base_url(args)}/v1/projects/{args.project}/runs/{args.run}/finalize",
+        f"{_base_url(args)}/v1/projects/{args.project}/runs/{args.run}/finalize{query}",
         {},
     )
     if getattr(args, "json", False):
@@ -302,8 +303,8 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     d = env.get("data") or {}
     stopped = d.get("stopped_containers") or []
     print(
-        f"ok={env.get('ok')} finalized={d.get('finalized')} "
-        f"already={d.get('already_finalized')} run_status={d.get('run_status')} "
+        f"ok={env.get('ok')} requested={d.get('finalize_requested')} "
+        f"already={d.get('already_finalized')} "
         f"stopped={','.join(stopped) if stopped else '-'}"
     )
     for line in _err_lines(env):
@@ -559,6 +560,7 @@ def command_remote(argv: list[str]) -> int:
     s = sub.add_parser("finalize")
     s.add_argument("project")
     s.add_argument("run")
+    s.add_argument("--cancel", action="store_true", help="withdraw a pending force-finalize")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_finalize)
 

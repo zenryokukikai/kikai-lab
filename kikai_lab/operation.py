@@ -1779,6 +1779,47 @@ def _composed_docker_name(
     return resolved_name
 
 
+def ephemeral_child_name_regex(
+    container: dict[str, Any], container_id: str, tag: str
+) -> re.Pattern[str] | None:
+    """Anchored regex matching the RUNTIME names of this container's step-suffixed
+    ephemeral children (suffix ``step{NNNNNN}__{tag}``), mirroring the truncation
+    and mangling ``_composed_docker_name`` applies. Reconstructing names from the
+    full declared docker.name is wrong the moment the 63-char ``--name`` bound
+    truncates the base or the suffix mangle rewrites/cuts the tag."""
+    docker_meta = container.get("docker")
+    declared = docker_meta.get("name") if isinstance(docker_meta, dict) else None
+    if not (isinstance(declared, str) and declared):
+        return None
+    resolved = resolve_text_ref(declared)
+    safe_tag = re.sub(r"[^A-Za-z0-9_.-]", "_", tag)
+    # step{:06d} is MINIMUM 6 digits — runs past 999,999 steps grow the suffix,
+    # which shifts both the [:50] suffix cut and the base truncation. Build one
+    # alternative per plausible digit count so every width matches exactly.
+    alternatives = []
+    for digits in range(6, 10):
+        prefix_len = 4 + digits + 2  # "step" + digits + "__"
+        safe_suffix_len = min(prefix_len + len(safe_tag), 50)
+        kept_tag = safe_tag[: max(0, safe_suffix_len - prefix_len)]
+        base = resolved[: max(1, 63 - safe_suffix_len - 2)]
+        alternatives.append(
+            rf"{re.escape(base)}__step\d{{{digits}}}__{re.escape(kept_tag)}"
+        )
+    unique = list(dict.fromkeys(alternatives))
+    return re.compile(r"^(?:" + "|".join(unique) + r")$")
+
+
+def docker_attribution_labels(request: dict[str, Any], container_id: str) -> list[str]:
+    """``--label`` args attributing a container to its kikai registry record and
+    invocation suffix. Labels survive any change to the __suffix NAME convention,
+    so /docker/ps and finalize can attribute by label instead of re-parsing names."""
+    labels = ["--label", f"kikai.container_id={container_id}"]
+    suffix = request.get("container_name_suffix") if isinstance(request, dict) else None
+    if isinstance(suffix, str) and suffix:
+        labels.extend(["--label", f"kikai.suffix={suffix}"])
+    return labels
+
+
 def docker_run_command(
     *,
     request: dict[str, Any],
@@ -1795,6 +1836,7 @@ def docker_run_command(
     resolved_name = _composed_docker_name(container, container_id, request)
     if resolved_name and _SAFE_CONTAINER_NAME.match(resolved_name):
         command.extend(["--name", resolved_name])
+    command.extend(docker_attribution_labels(request, container_id))
     gpus = container.get("gpus")
     if isinstance(gpus, str) and gpus:
         command.extend(["--gpus", resolve_text_ref(gpus)])
@@ -1844,6 +1886,7 @@ def docker_detached_run_command(
         "--name",
         container_name,
     ]
+    command.extend(docker_attribution_labels(request, container_id))
     gpus = container.get("gpus")
     if isinstance(gpus, str) and gpus:
         command.extend(["--gpus", resolve_text_ref(gpus)])
@@ -1989,7 +2032,7 @@ def docker_ps_all(request: dict[str, Any]) -> list[dict[str, Any]]:
     The pipe-delimited --format mirrors execute_remote_docker_teardown_operation's
     remote listing so both surfaces describe containers identically.
     """
-    fmt = "{{.Names}}|{{.State}}|{{.Status}}|{{.Image}}|{{.RunningFor}}"
+    fmt = "{{.Names}}|{{.State}}|{{.Status}}|{{.Image}}|{{.RunningFor}}|{{.Labels}}"
     command = [os.environ.get("KIKAI_DOCKER_BIN", "docker"), "ps", "-a", "--format", fmt]
     try:
         completed = subprocess.run(
@@ -2022,9 +2065,15 @@ def docker_ps_all(request: dict[str, Any]) -> list[dict[str, Any]]:
     for line in completed.stdout.splitlines():
         if not line.strip():
             continue
-        parts = line.split("|", 4)
+        parts = line.split("|", 5)
         if len(parts) < 5:
             continue
+        labels: dict[str, str] = {}
+        if len(parts) > 5 and parts[5]:
+            for item in parts[5].split(","):
+                key, sep, value = item.partition("=")
+                if sep and key.startswith("kikai."):
+                    labels[key] = value
         rows.append(
             {
                 "name": parts[0],
@@ -2032,6 +2081,7 @@ def docker_ps_all(request: dict[str, Any]) -> list[dict[str, Any]]:
                 "status": parts[2],
                 "image": parts[3],
                 "running_for": parts[4],
+                "labels": labels,
             }
         )
     return rows
