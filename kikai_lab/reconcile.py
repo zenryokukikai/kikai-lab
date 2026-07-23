@@ -110,6 +110,22 @@ def control_path(project_root: Path, run_id: str) -> Path:
     return managed_runs_dir(project_root) / f"{run_id}.control.json"
 
 
+def terminal_status_from_event(terminal_event: str | None, *, forced: bool = False) -> str:
+    """Terminal display status for a finalized run. The run record's declared
+    status is written once at submit ('running') and NEVER updated — the daemon
+    records the terminal truth in progress.json (its own file; no cross-process
+    write conflict with the server) and every read surface prefers it."""
+    if terminal_event == "early_stop":
+        return "early_stopped"
+    if terminal_event == "done":
+        return "completed"
+    if terminal_event == "stopped_by_control":
+        return "stopped"
+    # no terminal metrics row: an operator force-finalize is an intentional
+    # stop; anything else is a crash and must not read as success
+    return "stopped" if forced else "failed"
+
+
 def read_control(project_root: Path, run_id: str) -> dict[str, Any]:
     """Operator requests written by the SERVER process (its only writer), read
     fresh by the daemon before each backfill op. A separate file from
@@ -1168,6 +1184,21 @@ def tick(
 
     # Already finalized -> idempotent no-op (keep reporting terminal state).
     if progress.get("finalized"):
+        if "terminal_status" not in progress:
+            # self-healing migration: runs finalized before terminal_status
+            # existed still show their submit-time 'running' on every list
+            # surface — derive once from the terminal metrics event. The
+            # forced flag survives on disk (control.json is never cleared by
+            # finalize), so an operator-stopped run backfills as 'stopped',
+            # not 'failed', exactly like a post-upgrade force finalize.
+            try:
+                event = read_terminal_event(resolve_metrics_path(run_dir))
+            except OSError:
+                event = None
+            progress["terminal_status"] = terminal_status_from_event(
+                event,
+                forced=bool(read_control(project_root, run_id).get("force_finalize")),
+            )
         summary["status"] = {"finalized": True}
         summary["lifecycle_state"] = progress.get("lifecycle_state")
         write_progress(project_root, run_id, progress)
@@ -1667,6 +1698,9 @@ def tick(
                 )
             progress["finalized"] = True
             progress["lifecycle_state"] = "done"
+            progress["terminal_status"] = terminal_status_from_event(
+                terminal_event, forced=bool(force_finalize)
+            )
             summary["finalized"] = True
             try:
                 from kikai_lab.server.registry import append_journal

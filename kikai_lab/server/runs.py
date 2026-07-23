@@ -154,6 +154,16 @@ def inspect_training_container(
     }
 
 
+def display_status(record: dict[str, Any], progress: dict[str, Any]) -> str | None:
+    """List-surface status WITHOUT docker/metrics I/O. The declared record
+    status is frozen at submit ('running') — for finalized runs prefer the
+    daemon-recorded terminal_status ('finalized' when a pre-migration progress
+    hasn't been backfilled yet) so dashboards never show phantom 'running'."""
+    if progress.get("finalized"):
+        return progress.get("terminal_status") or "finalized"
+    return record.get("status")
+
+
 def derive_status(
     *,
     declared: str | None,
@@ -162,6 +172,11 @@ def derive_status(
     terminal_event: str | None,
 ) -> str:
     if progress.get("finalized"):
+        # the daemon records the terminal truth at finalize time (including the
+        # operator-forced case, which a bare terminal_event cannot distinguish)
+        stored = progress.get("terminal_status")
+        if stored:
+            return stored
         if terminal_event == "early_stop":
             return "early_stopped"
         if terminal_event == "done":
@@ -320,7 +335,7 @@ def build_runs_router(config: ServerConfig) -> APIRouter:
                 if metrics_path.exists():
                     latest = read_last_train_metrics(metrics_path)
             summaries[name] = {
-                "status": record.get("status"),
+                "status": display_status(record, load_progress(path, name)),
                 "verdict": record.get("verdict"),
                 "experiment_id": record.get("experiment_id"),
                 "parent_run": submission.get("parent_run"),
@@ -430,7 +445,7 @@ def build_runs_router(config: ServerConfig) -> APIRouter:
             summary = {
                 "run_name": run_name,
                 "experiment_id": record.get("experiment_id"),
-                "status": record.get("status"),
+                "status": display_status(record, progress),
                 "verdict": record.get("verdict"),
                 "lifecycle_state": progress.get("lifecycle_state")
                 if progress.get("ticks")

@@ -39,6 +39,7 @@ from kikai_lab.server.registry import (
     utc_now_text,
     validate_record_schema,
 )
+from kikai_lab.server.runs import display_status
 from kikai_lab.store import compute_current_state, load_current
 from kikai_lab.validation import (
     validate_data_sources,
@@ -319,7 +320,7 @@ def build_projects_router(config: ServerConfig) -> APIRouter:
             managed = (path / "managed_runs" / f"{run_name}.yaml").is_file()
             entry = {
                 "run_name": run_name,
-                "status": record.get("status"),
+                "status": display_status(record, progress),
                 "verdict": record.get("verdict"),
                 "probe": (record.get("probe") or {}).get("question")
                 if record.get("probe")
