@@ -446,6 +446,108 @@ def test_reconcile_force_finalize_pending_while_training_runs(tmp_path: Path) ->
     assert summary2["force_finalize"] == "pending_docker_unreachable"
 
 
+def test_reconcile_force_finalize_mid_marathon_tick(tmp_path: Path) -> None:
+    """A backlog tick that STARTED while training was running must still honor a
+    force request that lands after the training exits mid-tick — the tick-start
+    status snapshot must not freeze training_inactive for hours (live incident
+    2026-07-23: force ignored for the whole marathon tick)."""
+    from kikai_lab.reconcile import tick
+
+    project = tmp_path / "proj"
+    (project / "managed_runs").mkdir(parents=True)
+    (project / "containers").mkdir()
+    (project / "containers" / "trainer.yaml").write_text(yaml.safe_dump({
+        "container_id": "trainer", "kind": "docker_container", "schema_version": 1,
+        "host_id": "h", "role": "training", "status": "ephemeral_run", "summary": "t",
+        "docker": {"name": "trainer-box", "image": "img:1"},
+    }))
+    run_dir = tmp_path / "run_dir"
+    (run_dir / "checkpoints").mkdir(parents=True)
+    for step in (1000, 2000, 3000):
+        (run_dir / "checkpoints" / f"checkpoint_step_{step}.pt").write_bytes(b"x")
+    managed = {
+        "run_id": "r1", "run_dir": str(run_dir), "training_container_id": "trainer",
+        "qc_op": {"kind": "kikai_operation", "schema_version": 1, "request": {
+            "adapter": "webhook_notification", "operation": "qc_{{step6}}",
+            "notification_id": "qc_{{step6}}", "delivery_target_id": "d",
+            "message": "m", "project_root": str(project)}},
+    }
+    progress = {"run_id": "r1", "seen_running": True}
+    executed: list[str] = []
+    inspect_calls = {"n": 0}
+
+    def fake_execute(op):
+        executed.append(op["request"].get("operation") or op["request"]["adapter"])
+        # training exits and the operator forces finalize while op #1 runs
+        (project / "managed_runs" / "r1.control.json").write_text(
+            json.dumps({"force_finalize": True})
+        )
+        return {"result_summary": {"execution_status": "x"}}
+
+    def fake_inspect(request, name):
+        inspect_calls["n"] += 1
+        running = inspect_calls["n"] == 1  # tick-start snapshot: still training
+        status = "running" if running else "exited"
+        return True, [{"State": {"Running": running, "Status": status, "ExitCode": 0}}], ""
+
+    summary = tick(project, managed, progress, execute=fake_execute, inspect=fake_inspect)
+    assert summary["backfill_cancelled"] == "force_finalize"
+    assert [n for n in executed if n.startswith("qc_")] == ["qc_001000"]
+    assert progress["finalized"] is True
+
+
+def test_reconcile_force_pending_against_live_training_repolls_with_ttl(tmp_path: Path) -> None:
+    """A pending force against a STILL-RUNNING training must not re-poll docker
+    per backfill step (TTL-bounded), must keep QC running, and must survive a
+    poll that raises a non-OperationError."""
+    from kikai_lab.reconcile import tick
+
+    project = tmp_path / "proj"
+    (project / "managed_runs").mkdir(parents=True)
+    (project / "containers").mkdir()
+    (project / "containers" / "trainer.yaml").write_text(yaml.safe_dump({
+        "container_id": "trainer", "kind": "docker_container", "schema_version": 1,
+        "host_id": "h", "role": "training", "status": "ephemeral_run", "summary": "t",
+        "docker": {"name": "trainer-box", "image": "img:1"},
+    }))
+    run_dir = tmp_path / "run_dir"
+    (run_dir / "checkpoints").mkdir(parents=True)
+    for step in (1000, 2000, 3000):
+        (run_dir / "checkpoints" / f"checkpoint_step_{step}.pt").write_bytes(b"x")
+    managed = {
+        "run_id": "r1", "run_dir": str(run_dir), "training_container_id": "trainer",
+        "qc_op": {"kind": "kikai_operation", "schema_version": 1, "request": {
+            "adapter": "webhook_notification", "operation": "qc_{{step6}}",
+            "notification_id": "qc_{{step6}}", "delivery_target_id": "d",
+            "message": "m", "project_root": str(project)}},
+    }
+    (project / "managed_runs" / "r1.control.json").write_text(
+        json.dumps({"force_finalize": True})
+    )
+    progress = {"run_id": "r1"}
+    executed: list[str] = []
+    inspect_calls = {"n": 0}
+
+    def fake_execute(op):
+        executed.append(op["request"].get("operation") or op["request"]["adapter"])
+        return {"result_summary": {"execution_status": "x"}}
+
+    def running_inspect(request, name):
+        inspect_calls["n"] += 1
+        if inspect_calls["n"] == 2:
+            raise RuntimeError("transient docker hiccup")  # non-OperationError
+        return True, [{"State": {"Running": True, "Status": "running"}}], ""
+
+    summary = tick(project, managed, progress, execute=fake_execute, inspect=running_inspect)
+    # QC continued for all steps; force stayed pending; nothing finalized
+    assert [n for n in executed if n.startswith("qc_")] == [
+        "qc_001000", "qc_002000", "qc_003000"]
+    assert not progress.get("finalized")
+    assert str(summary["force_finalize"]).startswith("pending")
+    # tick-start poll + ONE TTL-bounded re-poll (which raised) — not one per step
+    assert inspect_calls["n"] == 2
+
+
 def test_resubmit_clears_stale_progress_and_control(tmp_path: Path, monkeypatch) -> None:
     client = make_client(tmp_path)
     prepare_project(tmp_path, client)
