@@ -1190,12 +1190,42 @@ def tick(
     # the rest of the run, and an inspect error (docker unreachable) must not
     # be mistaken for "exited" (mirrors the container_gone rule below).
     training_inactive = (not status.get("running")) and (not status.get("inspect_error"))
+    latest_status = status  # freshest poll result; the terminal block reads this
     force_finalize = bool(read_control(project_root, run_id).get("force_finalize"))
+    _repoll_at: float | None = None  # None (not 0.0): monotonic() can start near 0
+    REPOLL_TTL_SEC = 30.0
 
     def _force_requested() -> bool:
-        nonlocal force_finalize
+        nonlocal force_finalize, training_inactive, latest_status, _repoll_at
         if not force_finalize:
             force_finalize = bool(read_control(project_root, run_id).get("force_finalize"))
+        if force_finalize and not training_inactive:
+            # A backlog tick can outlive the training by hours (marathon tick):
+            # the status snapshot from tick start would freeze training_inactive
+            # at False and silently ignore the force request for the whole tick
+            # (observed live 2026-07-23). Re-poll on demand, TTL-bounded so a
+            # pending force against a STILL-RUNNING training costs one docker
+            # inspect per 30 s, not one per pending backfill step. Any poll
+            # failure defers the force (fail-safe), never crashes the tick.
+            now = time.monotonic()
+            if _repoll_at is not None and now - _repoll_at < REPOLL_TTL_SEC:
+                return False
+            _repoll_at = now
+            try:
+                fresh = poll_status(
+                    project_root, managed_run["training_container_id"], inspect=inspect
+                )
+            except Exception as exc:  # noqa: BLE001 — any poll failure defers, never crashes
+                latest_status = {
+                    "exists": False, "running": False,
+                    "inspect_error": f"repoll_failed:{type(exc).__name__}",
+                }
+                return False
+            latest_status = fresh
+            summary["status"] = fresh
+            training_inactive = (not fresh.get("running")) and (
+                not fresh.get("inspect_error")
+            )
         return force_finalize and training_inactive
 
     # 2. QC every new checkpoint exactly once (commit each step BEFORE the next -> no dup post)
@@ -1576,7 +1606,7 @@ def tick(
         terminally_exited = True
     elif force_finalize and not training_inactive and not progress.get("finalized"):
         summary["force_finalize"] = (
-            "pending_docker_unreachable" if status.get("inspect_error")
+            "pending_docker_unreachable" if latest_status.get("inspect_error")
             else "pending_training_exit"
         )
     if terminally_exited and not progress.get("finalized"):
