@@ -30,6 +30,7 @@ from kikai_lab.reconcile import (
     checkpoint_steps,
     load_managed_run,
     load_progress,
+    read_control,
     read_terminal_event,
 )
 from kikai_lab.server.app import envelope_response
@@ -544,6 +545,12 @@ def build_runs_router(config: ServerConfig) -> APIRouter:
                 "last_error": progress.get("last_error"),
                 "delivery_failures": recent_delivery_failures(progress),
                 "terminal_event": terminal_event,
+                # a force-finalize written by POST .../finalize is pending until
+                # the daemon consumes it — surface it so the operator can tell
+                # "accepted, waiting for the next tick" from "request lost"
+                "force_finalize_pending": bool(
+                    read_control(path, run_name).get("force_finalize")
+                ) and not bool(progress.get("finalized")),
             }
 
         if wait is not None and wait != "state_change":

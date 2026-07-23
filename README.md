@@ -81,6 +81,23 @@ The full golden path — experiment, container profile, bundle, submit with gate
 QC, retention, finalize — is in `GET /v1/skill.md` and exercised end to end by
 the toy trainer's [README](examples/toy_trainer/README.md).
 
+### `bin/kk` — remote-CLI wrapper
+
+Driving a remote server means repeating `cd <checkout> && KIKAI_SERVER_URL=…
+uv run kikai remote …` for every call. `bin/kk` bakes that in: it resolves the
+checkout from its own location (symlink-safe), loads repo-local defaults from a
+gitignored `.env` (see [.env.example](.env.example)), and forwards everything to
+`uv run kikai`. `r` is shorthand for `remote`.
+
+```bash
+cp .env.example .env               # set KIKAI_SERVER_URL=http://<host>:8300
+bin/kk r ps <project>              # kikai-managed containers (ssh-free docker ps)
+bin/kk r run <project> <run>       # status + progress digest
+bin/kk r finalize <project> <run>  # force-finalize: stop QC/probe backfill
+bin/kk server start …              # non-remote subcommands pass through too
+ln -s "$PWD/bin/kk" ~/bin/kk       # optional: put it on PATH; symlinks resolve
+```
+
 ## Security
 
 kikai launches containers on its host: **reaching the API means running code on

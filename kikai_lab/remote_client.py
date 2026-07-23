@@ -18,6 +18,8 @@ Subcommands::
   kikai remote op <project> --file req.json          # run op; script events auto-extracted
   kikai remote submit-from <project> <run> <parent> --overrides-file f.json
   kikai remote stop <project> <run>
+  kikai remote finalize <project> <run>              # force-finalize: stop QC/probe backfill
+  kikai remote ps <project>                          # kikai-managed containers (ssh-free docker ps)
   kikai remote bundles <project>                     # bundle list (ssh-free)
   kikai remote bundle-get <project> <bundle>         # entrypoints/argv detail
   kikai remote bundle-put <project> <bundle> --dir d # tar a dir -> PUT bundle
@@ -289,6 +291,50 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0 if env.get("ok") else 1
 
 
+def cmd_finalize(args: argparse.Namespace) -> int:
+    query = "?cancel=true" if getattr(args, "cancel", False) else ""
+    env = _http(
+        "POST",
+        f"{_base_url(args)}/v1/projects/{args.project}/runs/{args.run}/finalize{query}",
+        {},
+    )
+    if getattr(args, "json", False):
+        return _print_json(env)
+    d = env.get("data") or {}
+    stopped = d.get("stopped_containers") or []
+    print(
+        f"ok={env.get('ok')} requested={d.get('finalize_requested')} "
+        f"already={d.get('already_finalized')} "
+        f"stopped={','.join(stopped) if stopped else '-'}"
+    )
+    for line in _err_lines(env):
+        print(line)
+    return 0 if env.get("ok") else 1
+
+
+def cmd_ps(args: argparse.Namespace) -> int:
+    env = _http("GET", f"{_base_url(args)}/v1/projects/{args.project}/docker/ps")
+    if getattr(args, "json", False):
+        return _print_json(env)
+    rows = (env.get("data") or {}).get("containers") or []
+    for row in rows:
+        origin = row.get("origin") or {}
+        kind = origin.get("kind", "container")
+        detail = origin.get("probe_id") or origin.get("eval_id") or origin.get("suffix") or ""
+        step = origin.get("step")
+        tag = kind + (f":{detail}" if detail else "")
+        if step is not None:
+            tag += f"@{step}"
+        print(
+            f"{row.get('state', '?'):8} {row.get('name')}  "
+            f"[{origin.get('container_id')}] {tag}  {row.get('running_for', '')}"
+        )
+    print(f"count={len(rows)}")
+    for line in _err_lines(env):
+        print(line)
+    return 0 if env.get("ok") else 1
+
+
 BUNDLE_MANIFEST_NAME = "kikai_bundle.json"
 # macOS junk that hand-rolled `tar` on a Mac smuggles into uploads: AppleDouble
 # resource forks (``._*``), Finder metadata, and the zip-era ``__MACOSX`` dir.
@@ -510,6 +556,18 @@ def command_remote(argv: list[str]) -> int:
     s.add_argument("project")
     s.add_argument("run")
     s.set_defaults(fn=cmd_stop)
+
+    s = sub.add_parser("finalize")
+    s.add_argument("project")
+    s.add_argument("run")
+    s.add_argument("--cancel", action="store_true", help="withdraw a pending force-finalize")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_finalize)
+
+    s = sub.add_parser("ps")
+    s.add_argument("project")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_ps)
 
     s = sub.add_parser("bundles")
     s.add_argument("project")

@@ -47,6 +47,10 @@ def write_fake_docker(tmp_path: Path):
         "    control['exists'] = False\n"
         "    control_path.write_text(json.dumps(control))\n"
         "    raise SystemExit(0)\n"
+        "if cmd == 'ps':\n"
+        "    for row in control.get('ps_rows', []):\n"
+        "        print(row)\n"
+        "    raise SystemExit(0)\n"
         "raise SystemExit(0)\n",
         encoding="utf-8",
     )
@@ -257,6 +261,303 @@ def test_stop_is_idempotent(tmp_path: Path, monkeypatch) -> None:
 
     missing = client.post("/v1/projects/example_new/runs/example_absent/stop")
     assert missing.status_code == 404
+
+
+def test_run_finalize_writes_control_and_stops_probe_containers(tmp_path: Path, monkeypatch) -> None:
+    client = make_client(tmp_path)
+    prepare_project(tmp_path, client)
+    fake, read_argv, set_control = write_fake_docker(tmp_path)
+    monkeypatch.setenv("KIKAI_DOCKER_BIN", str(fake))
+    set_container_env(monkeypatch, tmp_path)
+    submit(client)
+
+    project = tmp_path / "example_new"
+    managed_path = project / "managed_runs" / "example_run_a.yaml"
+    managed = yaml.safe_load(managed_path.read_text())
+    managed["probes"] = [
+        {"id": "pv", "container_id": "example_training", "every_steps": 1000,
+         "bundle_id": "example_trainer_v1", "entrypoint": "train", "args": []},
+    ]
+    managed_path.write_text(yaml.safe_dump(managed))
+    set_control(ps_rows=[
+        "example-training__step031000__probe_pv|running|Up 2 minutes|img:1|2 minutes|",
+        "example-training__step031000__probe_other|running|Up 2 minutes|img:1|2 minutes|",
+        "example-training|running|Up 1 hour|img:1|1 hour|",
+    ])
+
+    response = client.post("/v1/projects/example_new/runs/example_run_a/finalize")
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["finalize_requested"] is True
+    assert data["already_finalized"] is False
+    # only THIS run's declared probe id is stopped — not other probes, not training
+    assert data["stopped_containers"] == ["example-training__step031000__probe_pv"]
+    assert any(a[:2] == ["rm", "-f"] and a[2].endswith("probe_pv") for a in read_argv())
+
+    # the server writes ONLY the control file — progress.json stays daemon-owned,
+    # so a mid-tick stale write-back can never clobber the request
+    control = json.loads(
+        (project / "managed_runs" / "example_run_a.control.json").read_text()
+    )
+    assert control["force_finalize"] is True
+    assert not (project / "managed_runs" / "example_run_a.progress.json").exists()
+    run_record = yaml.safe_load((project / "runs" / "example_run_a.yaml").read_text())
+    assert run_record["status"] == "running"  # untouched; the reconciler owns closure
+
+    # an already-finalized run is answered idempotently without another control write
+    (project / "managed_runs" / "example_run_a.progress.json").write_text(
+        json.dumps({"run_id": "example_run_a", "finalized": True})
+    )
+    again = client.post("/v1/projects/example_new/runs/example_run_a/finalize")
+    assert again.json()["data"]["already_finalized"] is True
+
+    missing = client.post("/v1/projects/example_new/runs/example_absent/finalize")
+    assert missing.status_code == 404
+
+    # non-dict progress.json (valid JSON) must not 500
+    (project / "managed_runs" / "example_run_a.progress.json").write_text("[]")
+    weird = client.post("/v1/projects/example_new/runs/example_run_a/finalize")
+    assert weird.status_code == 200
+
+
+def test_ephemeral_child_name_regex_matches_composed_names() -> None:
+    from kikai_lab.operation import _composed_docker_name, ephemeral_child_name_regex
+
+    cases = [
+        ("short-name", "probe_pv", 31000),
+        ("a-very-long-container-base-name-that-exceeds-limits", "probe_preview1080", 31000),
+        ("x" * 60, "probe_pv", 31000),
+        ("medium-name-just-under", "probe_" + "p" * 60, 31000),  # suffix >50 -> truncated
+        ("name", "probe_weird id/slash", 31000),                 # mangled chars
+        ("short-name", "probe_pv", 1_000_000),                   # step{:06d} is a MINIMUM
+        ("x" * 60, "probe_preview1080", 123_456_789),            # 9 digits + truncation
+        ("short-name", "probe_pv", 99_999_999_999),              # 11 digits
+    ]
+    for declared, tag, step in cases:
+        container = {"docker": {"name": declared, "ephemeral": True}}
+        runtime = _composed_docker_name(
+            container, "cid", {"container_name_suffix": f"step{step:06d}__{tag}"}
+        )
+        pattern = ephemeral_child_name_regex(container, "cid", tag)
+        assert pattern is not None
+        assert pattern.match(runtime), (declared, tag, step, runtime, pattern.pattern)
+
+
+def test_reconcile_force_finalize_cancels_backfill_and_runs_terminal_block(tmp_path: Path) -> None:
+    from kikai_lab.reconcile import tick
+
+    project = tmp_path / "proj"
+    (project / "managed_runs").mkdir(parents=True)
+    (project / "containers").mkdir()
+    (project / "containers" / "trainer.yaml").write_text(yaml.safe_dump({
+        "container_id": "trainer", "kind": "docker_container", "schema_version": 1,
+        "host_id": "h", "role": "training", "status": "ephemeral_run", "summary": "t",
+        "docker": {"name": "trainer-box", "image": "img:1"},
+    }))
+    run_dir = tmp_path / "run_dir"
+    (run_dir / "checkpoints").mkdir(parents=True)
+    for step in (1000, 2000, 3000):
+        (run_dir / "checkpoints" / f"checkpoint_step_{step}.pt").write_bytes(b"x")
+    managed = {
+        "run_id": "r1", "run_dir": str(run_dir), "training_container_id": "trainer",
+        "qc_op": {"kind": "kikai_operation", "schema_version": 1, "request": {
+            "adapter": "webhook_notification", "operation": "qc_{{step6}}",
+            "notification_id": "qc_{{step6}}", "delivery_target_id": "d",
+            "message": "m", "project_root": str(project)}},
+    }
+    progress = {"run_id": "r1", "seen_running": True}
+    executed: list[str] = []
+
+    def fake_execute(op):
+        executed.append(op["request"].get("operation") or op["request"]["adapter"])
+        # the force request lands while the FIRST backfill op is running
+        (project / "managed_runs" / "r1.control.json").write_text(
+            json.dumps({"force_finalize": True})
+        )
+        return {"result_summary": {"execution_status": "x"}}
+
+    def fake_inspect(request, name):
+        return True, [{"State": {"Running": False, "Status": "exited", "ExitCode": 0}}], ""
+
+    summary = tick(project, managed, progress, execute=fake_execute, inspect=fake_inspect)
+    # first qc op ran, then the re-read of control cancelled the remaining backlog
+    assert summary["backfill_cancelled"] == "force_finalize"
+    qc_ops = [name for name in executed if name.startswith("qc_")]
+    assert len(qc_ops) == 1
+    # the REGULAR terminal block executed: teardown happened and the run finalized
+    assert summary["teardown"] == "ok"
+    assert progress["finalized"] is True
+    assert progress["lifecycle_state"] == "done"
+    # next tick short-circuits (no restart needed)
+    second = tick(project, managed, progress, execute=fake_execute, inspect=fake_inspect)
+    assert second["status"] == {"finalized": True}
+
+
+def test_reconcile_force_finalize_pending_while_training_runs(tmp_path: Path) -> None:
+    """A force request against a RUNNING training must neither finalize nor
+    disable QC — the documented safety invariant of the endpoint."""
+    from kikai_lab.reconcile import tick
+
+    project = tmp_path / "proj"
+    (project / "managed_runs").mkdir(parents=True)
+    (project / "containers").mkdir()
+    (project / "containers" / "trainer.yaml").write_text(yaml.safe_dump({
+        "container_id": "trainer", "kind": "docker_container", "schema_version": 1,
+        "host_id": "h", "role": "training", "status": "ephemeral_run", "summary": "t",
+        "docker": {"name": "trainer-box", "image": "img:1"},
+    }))
+    run_dir = tmp_path / "run_dir"
+    (run_dir / "checkpoints").mkdir(parents=True)
+    for step in (1000, 2000):
+        (run_dir / "checkpoints" / f"checkpoint_step_{step}.pt").write_bytes(b"x")
+    managed = {
+        "run_id": "r1", "run_dir": str(run_dir), "training_container_id": "trainer",
+        "qc_op": {"kind": "kikai_operation", "schema_version": 1, "request": {
+            "adapter": "webhook_notification", "operation": "qc_{{step6}}",
+            "notification_id": "qc_{{step6}}", "delivery_target_id": "d",
+            "message": "m", "project_root": str(project)}},
+    }
+    (project / "managed_runs" / "r1.control.json").write_text(
+        json.dumps({"force_finalize": True})
+    )
+    progress = {"run_id": "r1"}
+    executed: list[str] = []
+
+    def fake_execute(op):
+        executed.append(op["request"].get("operation") or op["request"]["adapter"])
+        return {"result_summary": {"execution_status": "x"}}
+
+    def running_inspect(request, name):
+        return True, [{"State": {"Running": True, "Status": "running"}}], ""
+
+    summary = tick(project, managed, progress, execute=fake_execute, inspect=running_inspect)
+    # QC continues (both steps ran), nothing finalized, request visibly pending
+    assert [n for n in executed if n.startswith("qc_")] == ["qc_001000", "qc_002000"]
+    assert not progress.get("finalized")
+    assert summary["force_finalize"] == "pending_training_exit"
+
+    # docker unreachable must ALSO refuse the shortcut (no premature notify)
+    def error_inspect(request, name):
+        from kikai_lab.operation import OperationError
+        raise OperationError("operation.docker_not_found", "docker missing", {})
+
+    summary2 = tick(project, managed, progress, execute=fake_execute, inspect=error_inspect)
+    assert not progress.get("finalized")
+    assert summary2["force_finalize"] == "pending_docker_unreachable"
+
+
+def test_resubmit_clears_stale_progress_and_control(tmp_path: Path, monkeypatch) -> None:
+    client = make_client(tmp_path)
+    prepare_project(tmp_path, client)
+    fake, _, set_control = write_fake_docker(tmp_path)
+    monkeypatch.setenv("KIKAI_DOCKER_BIN", str(fake))
+    set_container_env(monkeypatch, tmp_path)
+    project = tmp_path / "example_new"
+    (project / "managed_runs").mkdir(exist_ok=True)
+    # leftovers from the run_name's previous life
+    (project / "managed_runs" / "example_run_a.progress.json").write_text(
+        json.dumps({"run_id": "example_run_a", "finalized": True})
+    )
+    (project / "managed_runs" / "example_run_a.control.json").write_text(
+        json.dumps({"force_finalize": True})
+    )
+    response = submit(client)
+    assert response.status_code == 201, response.text
+    assert not (project / "managed_runs" / "example_run_a.progress.json").exists()
+    assert not (project / "managed_runs" / "example_run_a.control.json").exists()
+
+
+def test_retry_submit_preserves_live_progress(tmp_path: Path, monkeypatch) -> None:
+    """A retry of a crashed-mid-launch submit is the SAME run life: the daemon
+    may already have accumulated qc_done_steps for the (adopted) container —
+    unlinking progress there would re-QC every checkpoint (duplicate posts)."""
+    client = make_client(tmp_path)
+    prepare_project(tmp_path, client)
+    fake, _, _ = write_fake_docker(tmp_path)
+    monkeypatch.setenv("KIKAI_DOCKER_BIN", str(fake))
+    set_container_env(monkeypatch, tmp_path)
+    project = tmp_path / "example_new"
+
+    first = submit(client)
+    assert first.status_code == 201
+    # simulate the crash-mid-launch state that makes the same submit retryable
+    run_path = project / "runs" / "example_run_a.yaml"
+    record = yaml.safe_load(run_path.read_text())
+    record["status"] = "submitting"
+    run_path.write_text(yaml.safe_dump(record))
+    live = {"run_id": "example_run_a", "qc_done_steps": [1000, 2000], "seen_running": True}
+    (project / "managed_runs" / "example_run_a.progress.json").write_text(json.dumps(live))
+
+    retry = submit(client)
+    assert retry.status_code in (200, 201), retry.text
+    kept = json.loads((project / "managed_runs" / "example_run_a.progress.json").read_text())
+    assert kept["qc_done_steps"] == [1000, 2000]
+
+
+def test_finalize_cancel_clears_request_timestamp(tmp_path: Path, monkeypatch) -> None:
+    client = make_client(tmp_path)
+    prepare_project(tmp_path, client)
+    fake, _, _ = write_fake_docker(tmp_path)
+    monkeypatch.setenv("KIKAI_DOCKER_BIN", str(fake))
+    set_container_env(monkeypatch, tmp_path)
+    submit(client)
+    project = tmp_path / "example_new"
+    control_file = project / "managed_runs" / "example_run_a.control.json"
+
+    client.post("/v1/projects/example_new/runs/example_run_a/finalize")
+    first_ts = json.loads(control_file.read_text())["force_finalize_requested_at"]
+    cancelled = client.post(
+        "/v1/projects/example_new/runs/example_run_a/finalize", params={"cancel": "true"}
+    )
+    assert cancelled.json()["data"]["cancelled"] is True
+    control = json.loads(control_file.read_text())
+    assert control["force_finalize"] is False
+    assert "force_finalize_requested_at" not in control
+    # a re-request records ITS OWN timestamp, not the cancelled one's
+    client.post("/v1/projects/example_new/runs/example_run_a/finalize")
+    control = json.loads(control_file.read_text())
+    assert control["force_finalize"] is True
+    assert control["force_finalize_requested_at"] >= first_ts
+
+
+def test_project_containers_lists_only_kikai_managed(tmp_path: Path, monkeypatch) -> None:
+    client = make_client(tmp_path)
+    prepare_project(tmp_path, client)
+    fake, _, set_control = write_fake_docker(tmp_path)
+    monkeypatch.setenv("KIKAI_DOCKER_BIN", str(fake))
+    set_container_env(monkeypatch, tmp_path)
+    set_control(ps_rows=[
+        "example-training|running|Up 1 hour|img:1|1 hour|",
+        "example-training__c0835sg|exited|Exited (0) 5 minutes ago|img:1|10 minutes|",
+        "example-training__step031000__probe_pv|running|Up 2 minutes|img:1|2 minutes|",
+        "example-training__step005000|running|Up 1 minute|img:1|1 minute|",
+        "example-training__step007000__eval_gate|exited|Exited (0) 1 hour ago|img:1|2 hours|",
+        # labeled container: name truncated beyond recognition, labels win
+        "trunc-name__step001000__probe_x|running|Up 1 minute|img:1|1 minute|"
+        "kikai.container_id=example_training,kikai.suffix=step001000__probe_longid",
+        "unrelated-user-container|running|Up 3 weeks|other:latest|3 weeks|",
+    ])
+
+    response = client.get("/v1/projects/example_new/docker/ps")
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["count"] == 6  # unrelated container is not kikai's
+    by_name = {row["name"]: row for row in data["containers"]}
+    assert "unrelated-user-container" not in by_name
+    assert by_name["example-training"]["origin"] == {
+        "container_id": "example_training", "kind": "container"}
+    assert by_name["example-training__c0835sg"]["origin"] == {
+        "container_id": "example_training", "kind": "op", "suffix": "c0835sg"}
+    assert by_name["example-training__step031000__probe_pv"]["origin"] == {
+        "container_id": "example_training", "kind": "probe", "step": 31000, "probe_id": "pv"}
+    assert by_name["example-training__step005000"]["origin"] == {
+        "container_id": "example_training", "kind": "qc", "step": 5000}
+    assert by_name["example-training__step007000__eval_gate"]["origin"] == {
+        "container_id": "example_training", "kind": "evaluation", "step": 7000, "eval_id": "gate"}
+    # label-first attribution: the un-parseable NAME does not matter
+    assert by_name["trunc-name__step001000__probe_x"]["origin"] == {
+        "container_id": "example_training", "kind": "probe", "step": 1000,
+        "probe_id": "longid"}
 
 
 def test_operations_escape_hatch_noop_and_project_root_pinning(tmp_path: Path) -> None:
