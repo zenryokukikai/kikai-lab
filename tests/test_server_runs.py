@@ -219,6 +219,57 @@ def test_runs_index_lists_declared_and_managed(tmp_path: Path) -> None:
     assert filtered["data"]["total"] == 0
 
 
+def test_runs_index_shows_terminal_status_for_finalized(tmp_path: Path) -> None:
+    """Declared status freezes at 'running' forever (nothing rewrites the run
+    yaml) — list surfaces must show the daemon-recorded terminal truth instead
+    of phantom 'running' rows (dashboard incident 2026-07-23)."""
+    project = make_run_fixture(tmp_path, qc_done=[100])
+    progress_file = project / "managed_runs" / "example_run.progress.json"
+    progress = json.loads(progress_file.read_text())
+    progress.update(finalized=True, lifecycle_state="done", terminal_status="completed")
+    progress_file.write_text(json.dumps(progress))
+
+    client = make_client(tmp_path)
+    run = client.get("/v1/projects/example_a/runs").json()["data"]["runs"][0]
+    assert run["status"] == "completed"
+
+    # pre-migration progress (finalized before terminal_status existed):
+    # never show 'running'; 'finalized' until the daemon backfills
+    progress.pop("terminal_status")
+    progress_file.write_text(json.dumps(progress))
+    run = client.get("/v1/projects/example_a/runs").json()["data"]["runs"][0]
+    assert run["status"] == "finalized"
+
+    brief = client.get("/v1/projects/example_a/brief").json()["data"]
+    entry = next(r for r in brief["runs"] if r["run_name"] == "example_run")
+    assert entry["status"] == "finalized"
+
+
+def test_reconcile_tick_backfills_terminal_status(tmp_path: Path) -> None:
+    from kikai_lab.reconcile import tick
+
+    project = make_run_fixture(tmp_path, terminal="done", qc_done=[100])
+    managed = yaml.safe_load(
+        (project / "managed_runs" / "example_run.yaml").read_text()
+    )
+    progress = {"run_id": "example_run", "finalized": True, "lifecycle_state": "done"}
+    tick(project, managed, progress, execute=lambda op: {}, inspect=None)
+    assert progress["terminal_status"] == "completed"
+
+    # a pre-upgrade FORCE-finalized run (no terminal metrics row, control.json
+    # still carries the request) must backfill as 'stopped', not 'failed'
+    project2 = make_run_fixture(tmp_path / "b", qc_done=[100])
+    (project2 / "managed_runs" / "example_run.control.json").write_text(
+        json.dumps({"force_finalize": True})
+    )
+    managed2 = yaml.safe_load(
+        (project2 / "managed_runs" / "example_run.yaml").read_text()
+    )
+    progress2 = {"run_id": "example_run", "finalized": True, "lifecycle_state": "done"}
+    tick(project2, managed2, progress2, execute=lambda op: {}, inspect=None)
+    assert progress2["terminal_status"] == "stopped"
+
+
 def test_run_detail_merges_all_sources(tmp_path: Path, monkeypatch) -> None:
     make_run_fixture(tmp_path, steps=[100, 200, 300], qc_done=[100, 200])
     fake, set_control = write_fake_docker(tmp_path)
