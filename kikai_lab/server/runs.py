@@ -28,6 +28,7 @@ from kikai_lab.operation import (
 )
 from kikai_lab.reconcile import (
     checkpoint_steps,
+    display_status,
     load_managed_run,
     load_progress,
     read_control,
@@ -152,16 +153,6 @@ def inspect_training_container(
         "started_at": state.get("StartedAt"),
         "managed": managed_run is not None,
     }
-
-
-def display_status(record: dict[str, Any], progress: dict[str, Any]) -> str | None:
-    """List-surface status WITHOUT docker/metrics I/O. The declared record
-    status is frozen at submit ('running') — for finalized runs prefer the
-    daemon-recorded terminal_status ('finalized' when a pre-migration progress
-    hasn't been backfilled yet) so dashboards never show phantom 'running'."""
-    if progress.get("finalized"):
-        return progress.get("terminal_status") or "finalized"
-    return record.get("status")
 
 
 def derive_status(

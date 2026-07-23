@@ -110,6 +110,16 @@ def control_path(project_root: Path, run_id: str) -> Path:
     return managed_runs_dir(project_root) / f"{run_id}.control.json"
 
 
+def display_status(record: dict[str, Any], progress: dict[str, Any]) -> str | None:
+    """List-surface status WITHOUT docker/metrics I/O. The declared record
+    status is frozen at submit ('running') — for finalized runs prefer the
+    daemon-recorded terminal_status ('finalized' when a pre-migration progress
+    hasn't been backfilled yet) so dashboards never show phantom 'running'."""
+    if progress.get("finalized"):
+        return progress.get("terminal_status") or "finalized"
+    return record.get("status")
+
+
 def terminal_status_from_event(terminal_event: str | None, *, forced: bool = False) -> str:
     """Terminal display status for a finalized run. The run record's declared
     status is written once at submit ('running') and NEVER updated — the daemon

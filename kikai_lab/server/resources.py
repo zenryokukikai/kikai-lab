@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 from kikai_lab.envelope import next_action
 from kikai_lab.operation import OperationError
+from kikai_lab.reconcile import display_status, load_progress
 from kikai_lab.server.app import envelope_response, sanitize_details, sanitize_errors
 from kikai_lab.server.registry import (
     WRITE_LOCK,
@@ -164,10 +165,12 @@ def build_resources_router(config: ServerConfig) -> APIRouter:
         runs = []
         for run in list_yaml_records(path / "runs", kind="run"):
             if run.get("experiment_id") == experiment_id:
+                run_name = run.get("run_name")
+                progress = load_progress(path, run_name) if run_name else {}
                 runs.append(
                     {
-                        "run_name": run.get("run_name"),
-                        "status": run.get("status"),
+                        "run_name": run_name,
+                        "status": display_status(run, progress),
                         "fresh_no_resume": run.get("fresh_no_resume"),
                     }
                 )
