@@ -40,6 +40,38 @@ pre-1.0, so minor versions may contain breaking API changes.
 - `GET .../runs/{run}/status` now exposes the full reconciler progress
   digest: `probes_done_steps`, `op_fail_counts`, `op_gave_up`, `last_error`,
   and recent `delivery_failures`.
+- `delivery_summary` (`{total, expected, unrecorded, delivered, failed,
+  skipped, unverified, reasons, reason_samples}`) on the `/status` digest and
+  on `kikai remote run`, counted over EVERY recorded delivery outcome and
+  measured against the QC/probe steps the reconciler actually completed.
+  `delivery_failures` is a truncated tail (20 / CLI 5) with no denominator,
+  which hid a run whose QC posts were unconfirmed at every one of 60
+  checkpoints — a tail cannot express scale. `expected`/`unrecorded` cover the
+  other silence: a run whose delivery records were never written at all
+  (crash-restart replay, or a daemon predating delivery recording) used to
+  report `total: 0`, identical to a healthy run. `failed` (confirmed not
+  delivered) and `unverified` (kikai cannot confirm either way) are separate
+  numbers on every surface. `reasons` is keyed by a fixed vocabulary
+  (`skipped`, `post_failed`, `http_<code>`/`http_other`, `no_delivery_event`,
+  `unknown`) so its cardinality never depends on script-supplied error text;
+  that text survives as bounded `reason_samples`.
+- `discord_post_failed` is now part of the delivery-event vocabulary and is
+  recorded as `post_failed:<error>`. Previously a post that raised was filed
+  as `no_delivery_event`, i.e. a KNOWN failure was indistinguishable from
+  "the script emitted no event at all". Records written by a pre-upgrade
+  daemon keep their `no_delivery_event` shape on disk and therefore read as
+  `unverified`, while the same event recorded now reads as `failed` — see the
+  vintage caveat in `server/SKILL.md` before diagnosing a straddling run.
+- `kikai remote run` renders both delivery lines deterministically and marks
+  every cut: `reasons` is ordered by count (so which buckets survive a cut no
+  longer depends on dict insertion order) and clipped with the same `…` helper
+  as the recorded text, and the failure tail prints compact
+  `key=outcome(status):detail` rows instead of raw JSON — the same 300-char
+  budget now shows 4-5 rows instead of 1-3 cut mid-object.
+- Every delivery record and `delivery_failures` row carries an explicit
+  `outcome` (`delivered` / `http_error` / `post_failed` / `skipped` /
+  `no_delivery_event` / `unknown`); readers no longer classify from free text,
+  and script-supplied text is truncated once, with a visible `…` marker.
 - Delivery-outcome recording: after each QC/probe op the reconciler parses
   `{"event": "discord_post", "status": N}` / `discord_post_skipped` events
   from the op's captured stdout (and `artifact_delivery` step results) into

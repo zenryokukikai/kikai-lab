@@ -41,6 +41,18 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+# single source of truth for the delivery vocabulary/counting (the server's
+# /status digest calls the same function) — a second local implementation is
+# exactly how the two surfaces would drift apart again.
+from kikai_lab.reconcile import (
+    as_mapping,
+    clip_text,
+    delivery_confirmed,
+    delivery_outcome,
+    delivery_summary,
+    int_steps,
+)
+
 EVENT_RE = re.compile(r'\{"event"[^\n]+')
 
 
@@ -128,26 +140,46 @@ def cmd_run(args: argparse.Namespace) -> int:
     env = _http("GET", f"{_base_url(args)}/v1/projects/{args.project}/runs/{args.run}")
     if args.json:
         return _print_json(env)
-    d = env.get("data") or {}
-    c = d.get("container") or {}
-    m = d.get("latest_metrics") or {}
-    p = d.get("progress") or {}
-    loss = round(m["loss"], 3) if "loss" in m else "-"
+    # EVERY field below goes through as_mapping/int_steps, not `or {}`: this is
+    # the command an operator runs BECAUSE a run looks wrong, so a progress.json
+    # that is truncated, hand-edited or written by an older schema must cost
+    # information and nothing else. `or {}` only defends against null — a list,
+    # a string or a scalar sailed straight into `.items()` / `len()` and killed
+    # the digest before it printed a single delivery line.
+    d = as_mapping(env.get("data"))
+    c = as_mapping(d.get("container"))
+    m = as_mapping(d.get("latest_metrics"))
+    p = as_mapping(d.get("progress"))
+    loss = round(m["loss"], 3) if isinstance(m.get("loss"), (int, float)) else "-"
     print(
         f"status={d.get('derived_status')} running={c.get('running')} "
         f"step={m.get('step', '-')} loss={loss}"
     )
-    pd = p.get("probes_done_steps") or {}
-    probes = ", ".join(f"{k}:{len(v)}" for k, v in pd.items()) or "-"
-    fails = p.get("op_fail_counts") or {}
+    # counted with the SAME helper as delivery_summary's `expected`, so
+    # qc_done + probes and the delivery denominator can never disagree
+    pd = as_mapping(p.get("probes_done_steps"))
+    probes = ", ".join(f"{k}:{len(int_steps(v))}" for k, v in pd.items()) or "-"
+    fails = as_mapping(p.get("op_fail_counts"))
     fail_text = ", ".join(f"{k}:{v}" for k, v in fails.items()) or "-"
     print(
-        f"qc_done={len(p.get('qc_done_steps') or [])} probes={{{probes}}} "
+        f"qc_done={len(int_steps(p.get('qc_done_steps')))} probes={{{probes}}} "
         f"fails={{{fail_text}}} gave_up={p.get('op_gave_up') or '-'}"
     )
+    # scale FIRST, samples second: printing only the last 5 failures made a
+    # 60-of-60 delivery blackout read like a couple of recent hiccups.
+    summary = delivery_summary(p)
+    # printed whenever ANY QC/probe op ran — suppressing on total==0 turned
+    # "60 QC steps, not one delivery record" back into silence.
+    if summary["expected"] or summary["total"]:
+        print(
+            f"delivery={summary['delivered']}/{summary['expected']} delivered"
+            f" (failed={summary['failed']} skipped={summary['skipped']}"
+            f" unverified={summary['unverified']} unrecorded={summary['unrecorded']}"
+            f" {{{_delivery_reasons_text(summary['reasons'])}}})"
+        )
     bad = _delivery_failures(p)
     if bad:
-        print(f"delivery_failures: {json.dumps(bad, ensure_ascii=False)[:300]}")
+        print(f"delivery_failures: {_delivery_tail_text(bad)}")
     if p.get("last_error"):
         print(f"last_error: {p['last_error']}")
     for line in _err_lines(env):
@@ -156,16 +188,105 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def _delivery_failures(progress: dict[str, Any], limit: int = 5) -> list[dict[str, Any]]:
-    """Non-2xx delivery outcomes from progress['delivery'] (newest last)."""
+    """Non-delivered outcomes from progress['delivery'] (newest last), each with
+    its explicit ``outcome`` — same classifier as the server tail."""
     out = []
-    for key, entry in (progress.get("delivery") or {}).items():
+    # a corrupt progress.json degrades to "no rows", never to an exception
+    for key, entry in as_mapping(as_mapping(progress).get("delivery")).items():
         if not isinstance(entry, dict):
             continue
-        status = entry.get("status")
-        if isinstance(status, int) and 200 <= status < 300:
+        if delivery_confirmed(entry):
             continue
-        out.append({"key": key, **entry})
+        out.append({"key": key, **entry, "outcome": delivery_outcome(entry)})
     return out[-limit:]
+
+
+# CLI budgets. Both are spent through `clip_text`/whole-row drops, so a cut is
+# always visible as `…` — an unmarked cut reads as a complete message.
+DELIVERY_REASONS_MAX = 200
+DELIVERY_TAIL_MAX = 300
+DELIVERY_TAIL_DETAIL_MAX = 48
+
+
+def _delivery_reasons_text(reasons: dict[str, Any]) -> str:
+    """The `reasons` buckets, deterministically ordered and marked when cut.
+
+    Sorted by count DESC then key, so (a) the same summary always prints the
+    same line and (b) a cut drops the SMALLEST buckets. Dict insertion order
+    made "which buckets survive the cut" depend on the order records happened
+    to be written — arbitrary, and different between two reads of the same run."""
+    items = sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))
+    return clip_text(", ".join(f"{k}:{v}" for k, v in items), DELIVERY_REASONS_MAX) or "-"
+
+
+def _delivery_tail_row(row: dict[str, Any]) -> str:
+    """One failure row as ``key=outcome(status):detail``.
+
+    WHY not `json.dumps`: the tail is printed under a fixed char budget, and a
+    JSON blob spends most of it on braces, quotes and repeated field names —
+    adding the `outcome` field alone cut the visible rows from 4 to 3 (1-2 for
+    `post_failed` rows, whose error text is long), and the cut landed mid-object
+    so the last row was unparseable AND unmarked."""
+    outcome = row.get("outcome") or delivery_outcome(row)
+    text = f"{row.get('key')}={outcome}"
+    status = row.get("status")
+    if isinstance(status, int):
+        text += f"({status})"
+    detail = str(row.get("skipped_reason") or "")
+    # `skipped_reason` repeats the outcome for post_failed/no_delivery_event
+    # records; the row already states it, so print only what it ADDS.
+    #
+    # Stripped only on a SEPARATOR or an exact match. A bare `startswith` cut
+    # into reasons that legitimately BEGIN with the outcome word: a script
+    # reporting `skipped_by_config` printed `skipped:_by_config`, and
+    # `no_delivery_eventual` printed `no_delivery_event:ual` — mangled text in
+    # the one field whose job is to be read literally.
+    if detail == outcome:
+        detail = ""
+    else:
+        for sep in (":", " "):
+            if detail.startswith(f"{outcome}{sep}"):
+                detail = detail[len(outcome) + len(sep) :]
+                break
+    if detail:
+        text += f":{clip_text(detail, DELIVERY_TAIL_DETAIL_MAX)}"
+    return text
+
+
+def _delivery_tail_line(parts: list[str], dropped: int) -> str:
+    """The tail exactly as printed: drop-marker first, then the kept rows.
+
+    The marker is rendered HERE rather than prepended after the accounting, so
+    it is charged against the same budget as everything else — it used to be
+    free, and a "300-char" line measured 313."""
+    marker = f"…(+{dropped} older)" if dropped else ""
+    return " ".join([part for part in [marker, *parts] if part])
+
+
+def _delivery_tail_text(rows: list[dict[str, Any]]) -> str:
+    """The failure tail under DELIVERY_TAIL_MAX chars, cut on ROW boundaries.
+
+    Newest rows are kept (they are the tail's whole point) and a drop is stated
+    with a count — the reader never has to guess whether the list is complete."""
+    parts = [_delivery_tail_row(r) for r in rows]
+    if not parts:
+        return ""
+    # at least one row ALWAYS survives; whether it fits is decided below
+    kept = parts[-1:]
+    for start in range(len(parts) - 2, -1, -1):
+        if len(_delivery_tail_line(parts[start:], start)) > DELIVERY_TAIL_MAX:
+            break
+        kept = parts[start:]
+    dropped = len(parts) - len(kept)
+    line = _delivery_tail_line(kept, dropped)
+    if len(line) <= DELIVERY_TAIL_MAX:
+        return line
+    # The newest row alone is wider than the whole budget (a long probe id plus
+    # a long detail). Clip the ROW with the shared marker instead of dropping
+    # it: `delivery_failures: …(+1 older)` announces a failure and then says
+    # nothing about it, which is the silence this whole change set removes.
+    marker = f"…(+{dropped} older) " if dropped else ""
+    return marker + clip_text(kept[0], max(DELIVERY_TAIL_MAX - len(marker), 1))
 
 
 def cmd_artifacts(args: argparse.Namespace) -> int:

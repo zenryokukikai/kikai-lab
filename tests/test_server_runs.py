@@ -244,6 +244,15 @@ def test_runs_index_shows_terminal_status_for_finalized(tmp_path: Path) -> None:
     entry = next(r for r in brief["runs"] if r["run_name"] == "example_run")
     assert entry["status"] == "finalized"
 
+    # experiment detail page (5th status surface) must agree
+    client.put(
+        "/v1/projects/example_a/experiments/example_exp", json={"title": "Example"}
+    )
+    detail = client.get("/v1/projects/example_a/experiments/example_exp").json()
+    assert detail["ok"], detail
+    row = next(r for r in detail["data"]["runs"] if r["run_name"] == "example_run")
+    assert row["status"] == "finalized"
+
 
 def test_reconcile_tick_backfills_terminal_status(tmp_path: Path) -> None:
     from kikai_lab.reconcile import tick
