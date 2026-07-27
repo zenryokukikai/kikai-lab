@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 
 from kikai_lab.envelope import error, next_action
 from kikai_lab.operation import OperationError
+from kikai_lab.reconcile import display_status
 from kikai_lab.report import build_project_report
 from kikai_lab.server.app import envelope_response
 from kikai_lab.server.registry import (
@@ -39,7 +40,6 @@ from kikai_lab.server.registry import (
     utc_now_text,
     validate_record_schema,
 )
-from kikai_lab.server.runs import display_status
 from kikai_lab.store import compute_current_state, load_current
 from kikai_lab.validation import (
     validate_data_sources,

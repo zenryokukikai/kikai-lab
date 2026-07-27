@@ -67,8 +67,290 @@ def test_run_digest_shows_fails_and_delivery_failures(monkeypatch, capsys):
     rc.command_remote(["--base-url", "http://x", "run", "proj", "r"])
     out = capsys.readouterr().out
     assert "fails={qc:2000:2}" in out
+    assert "delivery=1/2 delivered" in out  # scale before samples
+    assert "skipped=1" in out and "failed=0" in out  # a skip is not a failure
     assert "delivery_failures:" in out and "no_webhook" in out
     assert "qc:1000" not in out  # a delivered post is not a failure
+
+
+def test_run_digest_delivery_scale_beats_the_five_row_tail(monkeypatch, capsys):
+    """60 unconfirmed QC posts must not read like 5 (the 2026-07-25 incident)."""
+    env = {"ok": True, "data": {
+        "derived_status": "completed", "container": {"running": False},
+        "latest_metrics": {"step": 60000, "loss": 1.0},
+        "progress": {"qc_done_steps": list(range(1000, 61000, 1000)),
+                     "delivery": {
+                         f"qc:{s}": {"status": None,
+                                     "outcome": "no_delivery_event",
+                                     "skipped_reason": "no_delivery_event"}
+                         for s in range(1000, 61000, 1000)}}}}
+    monkeypatch.setattr(rc, "_http", lambda *a, **k: env)
+    rc.command_remote(["--base-url", "http://x", "run", "proj", "r"])
+    out = capsys.readouterr().out
+    assert "delivery=0/60 delivered" in out
+    assert "unverified=60" in out and "failed=0" in out  # unverified != failed
+    assert "no_delivery_event:60" in out
+
+
+def test_run_digest_prints_delivery_line_when_nothing_was_recorded(monkeypatch, capsys):
+    """total==0 with 60 QC steps is the incident, not a healthy run: the line
+    must be printed (it used to be suppressed on a falsy total)."""
+    env = {"ok": True, "data": {
+        "derived_status": "running", "container": {"running": True},
+        "latest_metrics": {"step": 60000, "loss": 1.0},
+        "progress": {"qc_done_steps": list(range(1000, 61000, 1000)),
+                     "probes_done_steps": {"preview": [1000, 2000]}}}}
+    monkeypatch.setattr(rc, "_http", lambda *a, **k: env)
+    rc.command_remote(["--base-url", "http://x", "run", "proj", "r"])
+    out = capsys.readouterr().out
+    assert "delivery=0/62 delivered" in out
+    assert "unrecorded=62" in out
+
+
+def test_run_digest_delivery_line_is_capped_like_its_siblings(monkeypatch, capsys):
+    """The reasons blob is bounded: fixed-vocabulary keys, then a hard cap."""
+    env = {"ok": True, "data": {
+        "derived_status": "running", "container": {"running": True},
+        "latest_metrics": {"step": 60000, "loss": 1.0},
+        "progress": {"qc_done_steps": list(range(1000, 61000, 1000)),
+                     "delivery": {
+                         f"qc:{s}": {"status": None, "outcome": "post_failed",
+                                     "skipped_reason": f"post_failed:boom {'x' * 200}{s}"}
+                         for s in range(1000, 61000, 1000)}}}}
+    monkeypatch.setattr(rc, "_http", lambda *a, **k: env)
+    rc.command_remote(["--base-url", "http://x", "run", "proj", "r"])
+    line = next(
+        ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("delivery=")
+    )
+    assert "post_failed:60" in line and len(line) < 200
+
+
+def test_run_digest_omits_delivery_line_without_qc_activity(monkeypatch, capsys):
+    """No QC, no probes, no records — nothing to say (the only silent case)."""
+    env = {"ok": True, "data": {
+        "derived_status": "running", "container": {"running": True},
+        "latest_metrics": {"step": 100, "loss": 1.0}, "progress": {}}}
+    monkeypatch.setattr(rc, "_http", lambda *a, **k: env)
+    rc.command_remote(["--base-url", "http://x", "run", "proj", "r"])
+    assert "delivery=" not in capsys.readouterr().out
+
+
+def _delivery_line(out: str, prefix: str = "delivery=") -> str:
+    return next(ln for ln in out.splitlines() if ln.startswith(prefix))
+
+
+def test_delivery_reasons_are_deterministic_and_marked_when_cut():
+    """Which buckets survive the cut must not depend on dict insertion order.
+
+    Sorted by count DESC then key: two reads of the same run print the same
+    line, and a cut drops the SMALLEST buckets — and says it cut (an unmarked
+    truncation reads as a complete message, the rule `clip_text` exists for)."""
+    reasons = {"http_500": 1, "post_failed": 9, "skipped": 9, "http_404": 3}
+    text = rc._delivery_reasons_text(reasons)
+    assert text == "post_failed:9, skipped:9, http_404:3, http_500:1"
+    # same content, different insertion order -> byte-identical line
+    assert rc._delivery_reasons_text(dict(reversed(list(reasons.items())))) == text
+    # over budget: marked, capped, and the big buckets are the survivors
+    many = {f"http_{code}": 600 - code for code in range(400, 460)}
+    cut = rc._delivery_reasons_text(many)
+    assert len(cut) == rc.DELIVERY_REASONS_MAX and cut.endswith("…")
+    assert cut.startswith("http_400:200, http_401:199")
+    assert "http_459" not in cut  # smallest bucket, dropped
+    assert rc._delivery_reasons_text({}) == "-"
+
+
+def test_delivery_failure_tail_is_compact_and_never_cut_mid_row(monkeypatch, capsys):
+    """The tail's 300-char budget must buy ROWS, not JSON punctuation.
+
+    Regression: adding the `outcome` key to each row pushed the visible rows of
+    `json.dumps(bad)[:300]` from 4 to 3 (1-2 for `post_failed` rows), and the
+    cut landed mid-object — unparseable and unmarked."""
+    reason = "post_failed:HTTPSConnectionPool(host='example.invalid', port=443): timeout"
+    env = {"ok": True, "data": {
+        "derived_status": "running", "container": {"running": True},
+        "latest_metrics": {"step": 5000, "loss": 1.0},
+        "progress": {"qc_done_steps": [1000, 2000, 3000, 4000, 5000],
+                     "delivery": {
+                         "qc:1000": {"status": 500, "outcome": "http_error"},
+                         "qc:2000": {"status": None, "outcome": "skipped",
+                                     "skipped_reason": "no_webhook"},
+                         "qc:3000": {"status": None, "outcome": "no_delivery_event",
+                                     "skipped_reason": "no_delivery_event"},
+                         "probe:preview:3000": {"status": 403, "outcome": "http_error"},
+                         "qc:4000": {"status": None, "outcome": "post_failed",
+                                     "skipped_reason": reason}}}}}
+    monkeypatch.setattr(rc, "_http", lambda *a, **k: env)
+    rc.command_remote(["--base-url", "http://x", "run", "proj", "r"])
+    line = _delivery_line(capsys.readouterr().out, "delivery_failures:")
+    tail = line.split(": ", 1)[1]
+    assert len(tail) <= rc.DELIVERY_TAIL_MAX
+    assert "{" not in tail and '"' not in tail  # not JSON, so nothing to cut mid-object
+    # all five rows fit, each as key=outcome(status):detail
+    assert tail.split(" ")[:4] == [
+        "qc:1000=http_error(500)",
+        "qc:2000=skipped:no_webhook",
+        "qc:3000=no_delivery_event",     # free text repeats the outcome -> printed once
+        "probe:preview:3000=http_error(403)",
+    ]
+    assert not tail.startswith("…")  # nothing dropped: all five rows fit
+    assert all(f"{k}=" in tail for k in
+               ("qc:1000", "qc:2000", "qc:3000", "probe:preview:3000", "qc:4000"))
+    assert "qc:4000=post_failed:HTTPSConnectionPool" in tail  # detail kept, prefix dropped
+
+
+def test_delivery_failure_tail_drops_whole_rows_with_a_count(monkeypatch, capsys):
+    """When the budget does bind, the drop is stated and lands on a row boundary."""
+    reason = "post_failed:" + "e" * 300
+    env = {"ok": True, "data": {
+        "derived_status": "running", "container": {"running": True},
+        "latest_metrics": {"step": 5000, "loss": 1.0},
+        "progress": {"qc_done_steps": list(range(1000, 6000, 1000)),
+                     "delivery": {
+                         f"qc:{s}": {"status": None, "outcome": "post_failed",
+                                     "skipped_reason": reason}
+                         for s in range(1000, 6000, 1000)}}}}
+    monkeypatch.setattr(rc, "_http", lambda *a, **k: env)
+    rc.command_remote(["--base-url", "http://x", "run", "proj", "r"])
+    tail = _delivery_line(capsys.readouterr().out, "delivery_failures:").split(": ", 1)[1]
+    assert len(tail) <= rc.DELIVERY_TAIL_MAX
+    assert tail.startswith("…(+1 older) ")          # marked, and says how many
+    assert tail.endswith("…")                        # per-row detail cut is marked too
+    assert tail.count("qc:") == 4                    # 4 of 5 rows, vs 1-2 as JSON
+    assert "qc:5000=post_failed:eee" in tail         # the newest row is kept
+    # every kept row is whole: it starts with a key and carries its outcome
+    for row in tail.split(" ")[2:]:  # [0:2] is the "…(+1 older)" marker
+        assert row.startswith("qc:") and "=post_failed:" in row
+
+
+def test_delivery_tail_row_classifies_legacy_records():
+    """A pre-`outcome` record still renders with an explicit outcome."""
+    assert rc._delivery_tail_row(
+        {"key": "qc:1000", "status": None, "skipped_reason": "no_webhook"}
+    ) == "qc:1000=skipped:no_webhook"
+    assert rc._delivery_tail_row({"key": "qc:2000", "status": 404}) == "qc:2000=http_error(404)"
+
+
+def test_delivery_tail_row_keeps_reasons_that_start_with_the_outcome_word():
+    """The outcome prefix is dropped only on a SEPARATOR, never mid-word.
+
+    Regression: a bare `startswith` cut turned a script's own
+    `skipped_by_config` into `skipped:_by_config` and `no_delivery_eventual`
+    into `no_delivery_event:ual` — mangled text in the field whose whole job is
+    to be read literally."""
+    def row(outcome: str, reason: str) -> str:
+        return rc._delivery_tail_row(
+            {"key": "qc:1000", "outcome": outcome, "skipped_reason": reason}
+        )
+
+    assert row("skipped", "skipped_by_config") == "qc:1000=skipped:skipped_by_config"
+    assert row("no_delivery_event", "no_delivery_eventual") == (
+        "qc:1000=no_delivery_event:no_delivery_eventual"
+    )
+    # the cases the stripping exists for still strip
+    assert row("post_failed", "post_failed:boom") == "qc:1000=post_failed:boom"
+    assert row("post_failed", "post_failed boom") == "qc:1000=post_failed:boom"
+    assert row("no_delivery_event", "no_delivery_event") == "qc:1000=no_delivery_event"
+
+
+def test_delivery_tail_marker_is_charged_against_the_budget():
+    """`…(+N older)` is content: it must be paid for, not prepended for free.
+
+    Regression: the marker was added AFTER the accounting loop, so a tail
+    documented as <=300 chars measured 313."""
+    rows = [
+        {"key": f"qc:{step}", "outcome": "http_error", "status": 500}
+        for step in range(1000, 20000, 1000)
+    ]
+    text = rc._delivery_tail_text(rows)
+    assert len(text) <= rc.DELIVERY_TAIL_MAX
+    assert text.startswith("…(+")
+    # the marker's own cost bought fewer rows, and the count still matches
+    dropped = int(text.split("(+", 1)[1].split(" ", 1)[0])
+    assert dropped == len(rows) - text.count("qc:")
+    assert rc._delivery_tail_text([]) == ""
+
+
+def test_delivery_tail_keeps_one_clipped_row_when_a_row_exceeds_the_budget():
+    """A single oversized row is CLIPPED, never dropped to nothing.
+
+    Regression: one >300-char row rendered as `…(+1 older)` — a line that
+    announces failures and then says nothing about any of them."""
+    rows = [
+        {"key": "probe:" + "n" * 400 + ":1000", "outcome": "post_failed"},
+        {"key": "probe:" + "m" * 400 + ":2000", "outcome": "post_failed"},
+    ]
+    text = rc._delivery_tail_text(rows)
+    assert len(text) <= rc.DELIVERY_TAIL_MAX
+    assert text.startswith("…(+1 older) ")
+    assert text.endswith("…")                      # the clip is marked
+    assert "probe:mmm" in text                     # ...and the NEWEST row is what survives
+    # a lone oversized row has nothing older to report, so no marker at all
+    solo = rc._delivery_tail_text(rows[:1])
+    assert len(solo) <= rc.DELIVERY_TAIL_MAX
+    assert solo.startswith("probe:nnn") and solo.endswith("…")
+
+
+@pytest.mark.parametrize("progress", [
+    {"probes_done_steps": ["preview:1000"]},        # list where a map is expected
+    {"probes_done_steps": "preview"},               # string
+    {"probes_done_steps": {"preview": None}},       # steps not a list
+    {"probes_done_steps": {"preview": 5}},
+    {"qc_done_steps": 1000},                        # scalar
+    {"qc_done_steps": {"1000": True}},
+    {"op_fail_counts": ["qc:1000"]},                # list where a map is expected
+    {"op_fail_counts": "qc:1000"},
+    {"delivery": ["qc:1000"]},
+    {"delivery": "qc:1000"},
+    "garbage",                                      # the whole payload is wrong
+    42,
+    None,
+])
+def test_run_digest_survives_a_corrupt_progress_json(monkeypatch, capsys, progress):
+    """`kikai remote run` is the command an operator runs BECAUSE a run looks
+    wrong — it must never be the thing that dies on the wrong-looking payload.
+
+    Regression: `delivery_summary` was hardened but the three lines printed
+    BEFORE it still indexed the raw fields, so the exact shapes the corrupt-
+    payload test declares safe for `/status` still killed the CLI with
+    `AttributeError: 'list' object has no attribute 'items'`."""
+    env = {"ok": True, "data": {
+        "derived_status": "running", "container": {"running": True},
+        "latest_metrics": {"step": 5000, "loss": 1.0},
+        "progress": progress}}
+    monkeypatch.setattr(rc, "_http", lambda *a, **k: env)
+    assert rc.command_remote(["--base-url", "http://x", "run", "proj", "r"]) == 0
+    out = capsys.readouterr().out
+    # degraded to "no information", not to a traceback: the run's own status
+    # (the reason the operator called) is still printed
+    assert "status=running" in out and "step=5000" in out
+    assert "qc_done=" in out and "probes={" in out and "fails={" in out
+
+
+def test_run_digest_survives_a_corrupt_envelope(monkeypatch, capsys):
+    """Same contract one level up: a non-mapping data/container/metrics block."""
+    monkeypatch.setattr(rc, "_http", lambda *a, **k: {"ok": True, "data": "nope"})
+    assert rc.command_remote(["--base-url", "http://x", "run", "proj", "r"]) == 0
+    assert "status=None" in capsys.readouterr().out
+    env = {"ok": True, "data": {"derived_status": "running", "container": [],
+                                "latest_metrics": "x", "progress": {}}}
+    monkeypatch.setattr(rc, "_http", lambda *a, **k: env)
+    assert rc.command_remote(["--base-url", "http://x", "run", "proj", "r"]) == 0
+    assert "step=- loss=-" in capsys.readouterr().out
+
+
+def test_run_digest_counts_steps_like_the_delivery_denominator(monkeypatch, capsys):
+    """`qc_done` + `probes` and `delivery=/N` are computed by the SAME helper,
+    so the digest can never contradict itself (duplicates, bools, junk rows)."""
+    env = {"ok": True, "data": {
+        "derived_status": "running", "container": {"running": True},
+        "latest_metrics": {"step": 3000, "loss": 1.0},
+        "progress": {"qc_done_steps": [1000, 2000, 2000, True, "3000"],
+                     "probes_done_steps": {"preview": [1000, 1000], "bad": "x"}}}}
+    monkeypatch.setattr(rc, "_http", lambda *a, **k: env)
+    rc.command_remote(["--base-url", "http://x", "run", "proj", "r"])
+    out = capsys.readouterr().out
+    assert "qc_done=2" in out and "preview:1" in out and "bad:0" in out
+    assert "delivery=0/3 delivered" in out  # 2 qc + 1 probe, the same arithmetic
 
 
 # ------------------------------------------------------------------- artifacts

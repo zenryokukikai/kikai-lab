@@ -27,7 +27,12 @@ from kikai_lab.operation import (
     resolve_text_ref,
 )
 from kikai_lab.reconcile import (
+    as_mapping,
     checkpoint_steps,
+    delivery_confirmed,
+    delivery_outcome,
+    delivery_summary,
+    display_status,
     load_managed_run,
     load_progress,
     read_control,
@@ -154,16 +159,6 @@ def inspect_training_container(
     }
 
 
-def display_status(record: dict[str, Any], progress: dict[str, Any]) -> str | None:
-    """List-surface status WITHOUT docker/metrics I/O. The declared record
-    status is frozen at submit ('running') — for finalized runs prefer the
-    daemon-recorded terminal_status ('finalized' when a pre-migration progress
-    hasn't been backfilled yet) so dashboards never show phantom 'running'."""
-    if progress.get("finalized"):
-        return progress.get("terminal_status") or "finalized"
-    return record.get("status")
-
-
 def derive_status(
     *,
     declared: str | None,
@@ -211,16 +206,26 @@ def recent_delivery_failures(
 ) -> list[dict[str, Any]]:
     """The most recent non-delivered QC/probe outcomes from progress['delivery']
     (written by the reconciler): anything whose recorded status is not a 2xx —
-    explicit skips, non-2xx posts, and ops that emitted no delivery event at all.
-    Keys share the op_fail_counts vocabulary (qc:<step> / probe:<id>:<step>)."""
+    explicit skips, non-2xx posts, posts that raised, and ops that emitted no
+    delivery event at all. Keys share the op_fail_counts vocabulary
+    (qc:<step> / probe:<id>:<step>), and every row carries the explicit
+    ``outcome`` (``http_error`` / ``post_failed`` / ``skipped`` /
+    ``no_delivery_event`` / ``unknown``) so "confirmed not delivered" is never
+    read as the same thing as "cannot confirm".
+
+    This is a TRUNCATED TAIL — read ``delivery_summary`` for the scale (see
+    ``reconcile.delivery_summary``: a tail alone hid a 60-of-60 failure)."""
     failures: list[dict[str, Any]] = []
-    for key, entry in (progress.get("delivery") or {}).items():
+    # same total-function contract as delivery_summary: a corrupt progress.json
+    # must degrade to "no rows", not take the /status read down with it
+    for key, entry in as_mapping(as_mapping(progress).get("delivery")).items():
         if not isinstance(entry, dict):
             continue
-        status = entry.get("status")
-        if isinstance(status, int) and 200 <= status < 300:
+        if delivery_confirmed(entry):
             continue
-        failures.append({"key": key, **entry})
+        # legacy records carry no ``outcome``; classify them so the tail rows
+        # are uniform (a reader must never have to re-derive it from free text)
+        failures.append({"key": key, **entry, "outcome": delivery_outcome(entry)})
     return failures[-limit:]
 
 
@@ -558,6 +563,9 @@ def build_runs_router(config: ServerConfig) -> APIRouter:
                 "op_fail_counts": progress.get("op_fail_counts") or {},
                 "op_gave_up": progress.get("op_gave_up") or [],
                 "last_error": progress.get("last_error"),
+                # counts over ALL of progress['delivery'] — delivery_failures is
+                # only a tail, and a tail cannot say "60 of 60 never confirmed".
+                "delivery_summary": delivery_summary(progress),
                 "delivery_failures": recent_delivery_failures(progress),
                 "terminal_event": terminal_event,
                 # a force-finalize written by POST .../finalize is pending until

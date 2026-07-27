@@ -963,7 +963,34 @@ def test_progress_roundtrip_and_corrupt_recovery(tmp_path):
 
     # a corrupt/partial file -> clean default (never crash the tick)
     reconcile.progress_path(project_root, "r").write_text("{ not json")
-    assert reconcile.load_progress(project_root, "r") == reconcile.default_progress("r")
+    assert reconcile.load_progress(project_root, "r")["qc_done_steps"] == []
+
+
+def test_load_progress_normalizes_corrupt_step_bookkeeping(tmp_path):
+    """Parseable JSON of the WRONG SHAPE must also degrade to "no information".
+
+    Regression: `{int(s) for s in merged["qc_done_steps"]}` raised
+    `TypeError: 'int' object is not iterable` on a scalar — a 500 on `/status`,
+    i.e. the corrupt file took away the very read used to diagnose it. The
+    `probes_done_steps` map was not normalized at all, so a non-map there
+    crashed the tick's own `probes_done_all.get(probe_id)`."""
+    project_root = make_registry(tmp_path)
+    path = reconcile.progress_path(project_root, "r")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for corrupt in (1000, "1000", {"1000": True}, None, [1000, True, "x", 1000]):
+        path.write_text(json.dumps({"run_id": "r", "qc_done_steps": corrupt}))
+        loaded = reconcile.load_progress(project_root, "r")
+        assert loaded["qc_done_steps"] == ([1000] if isinstance(corrupt, list) else [])
+        assert loaded["probes_done_steps"] == {}
+    for corrupt in (["preview:1000"], "preview", 7):
+        path.write_text(json.dumps({"run_id": "r", "probes_done_steps": corrupt}))
+        assert reconcile.load_progress(project_root, "r")["probes_done_steps"] == {}
+    # a valid neighbour survives its garbage sibling, and stays sorted+deduped
+    path.write_text(json.dumps({"run_id": "r", "qc_done_steps": [2000, 1000, 2000],
+                                "probes_done_steps": {"p": [2000, 1000], "q": 5}}))
+    loaded = reconcile.load_progress(project_root, "r")
+    assert loaded["qc_done_steps"] == [1000, 2000]
+    assert loaded["probes_done_steps"] == {"p": [1000, 2000], "q": []}
 
 
 # --------------------------------------------------------------------------- #

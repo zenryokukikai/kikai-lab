@@ -110,6 +110,16 @@ def control_path(project_root: Path, run_id: str) -> Path:
     return managed_runs_dir(project_root) / f"{run_id}.control.json"
 
 
+def display_status(record: dict[str, Any], progress: dict[str, Any]) -> str | None:
+    """List-surface status WITHOUT docker/metrics I/O. The declared record
+    status is frozen at submit ('running') — for finalized runs prefer the
+    daemon-recorded terminal_status ('finalized' when a pre-migration progress
+    hasn't been backfilled yet) so dashboards never show phantom 'running'."""
+    if progress.get("finalized"):
+        return progress.get("terminal_status") or "finalized"
+    return record.get("status")
+
+
 def terminal_status_from_event(terminal_event: str | None, *, forced: bool = False) -> str:
     """Terminal display status for a finalized run. The run record's declared
     status is written once at submit ('running') and NEVER updated — the daemon
@@ -172,9 +182,21 @@ def load_progress(project_root: Path, run_id: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         return merged
     merged.update(data)
-    merged["qc_done_steps"] = sorted(
-        {int(s) for s in merged.get("qc_done_steps", []) if isinstance(s, int)}
-    )
+    # Normalize the step bookkeeping to its DECLARED shape, once, here: every
+    # consumer downstream (the tick's pending-work scan, the /status digest,
+    # the dashboard) then indexes it without a per-call type guard.
+    #
+    # WHY not just a comprehension: `{int(s) for s in merged["qc_done_steps"]}`
+    # raised `TypeError: 'int' object is not iterable` on a SCALAR value, which
+    # is a 500 on `/status` — the read an operator makes precisely BECAUSE the
+    # run looks wrong. A corrupt progress.json must cost information, never the
+    # ability to look. `probes_done_steps` gets the same treatment: it was
+    # unguarded, so a non-map there crashed the tick's own `.get(probe_id)`.
+    merged["qc_done_steps"] = sorted(int_steps(merged.get("qc_done_steps")))
+    merged["probes_done_steps"] = {
+        str(probe_id): sorted(int_steps(steps))
+        for probe_id, steps in as_mapping(merged.get("probes_done_steps")).items()
+    }
     return merged
 
 
@@ -232,10 +254,19 @@ def _gave_up(project_root: Path, run_id: str, progress: dict[str, Any], fail_key
 # WHY: "the QC video rendered but never arrived on Discord" used to be
 # diagnosable only by ssh-reading the op's stdout on the host. QC/probe scripts
 # print one-line JSON events ({"event": "discord_post", "status": 200} /
-# {"event": "discord_post_skipped", "reason": ...}); the daemon now parses them
+# {"event": "discord_post_skipped", "reason": ...} /
+# {"event": "discord_post_failed", "error": ...}); the daemon now parses them
 # out of the op result it already holds and persists the outcome per step, so
 # the status API can answer delivery questions without host access.
-DELIVERY_EVENT_NAMES = frozenset({"discord_post", "discord_post_skipped"})
+#
+# ``discord_post_failed`` belongs here even though it carries no status: the
+# scripts that emit it (a post that raised) were previously invisible to this
+# parser, so a KNOWN-failed post was filed under ``no_delivery_event`` — the same
+# bucket as "the script never even tried". Those are different incidents and the
+# operator must be able to tell them apart.
+DELIVERY_EVENT_NAMES = frozenset(
+    {"discord_post", "discord_post_skipped", "discord_post_failed"}
+)
 
 
 def extract_delivery_events(result: Any) -> list[dict[str, Any]]:
@@ -272,20 +303,262 @@ def extract_delivery_events(result: Any) -> list[dict[str, Any]]:
     return events
 
 
+# Every delivery record carries one of these EXPLICIT outcomes. The classifier
+# lives in the record (written once, at record time) instead of being re-derived
+# by every reader from free text — a reader parsing `skipped_reason` prefixes is
+# how two surfaces drift apart, and free text cannot be an aggregation key.
+DELIVERY_OUTCOME_DELIVERED = "delivered"    # confirmed 2xx
+DELIVERY_OUTCOME_HTTP_ERROR = "http_error"  # posted, non-2xx answer
+DELIVERY_OUTCOME_POST_FAILED = "post_failed"  # posted, the attempt raised
+DELIVERY_OUTCOME_SKIPPED = "skipped"        # deliberately not posted
+DELIVERY_OUTCOME_NO_EVENT = "no_delivery_event"  # op emitted nothing -> UNVERIFIED
+DELIVERY_OUTCOME_UNKNOWN = "unknown"        # event present but unusable -> UNVERIFIED
+DELIVERY_OUTCOMES = frozenset(
+    {
+        DELIVERY_OUTCOME_DELIVERED,
+        DELIVERY_OUTCOME_HTTP_ERROR,
+        DELIVERY_OUTCOME_POST_FAILED,
+        DELIVERY_OUTCOME_SKIPPED,
+        DELIVERY_OUTCOME_NO_EVENT,
+        DELIVERY_OUTCOME_UNKNOWN,
+    }
+)
+
+# script-supplied free text (skip reasons, exception strings) is bounded on the
+# way IN, once, with a visible marker. An unmarked cut reads as a complete
+# message, and an uncapped one lets a 5000-char traceback into every read
+# surface (both branches used to get this wrong, in opposite directions).
+DELIVERY_DETAIL_MAX = 160
+_TRUNCATION_MARKER = "…"
+
+# aggregate-side caps: `reasons` is keyed by the FIXED vocabulary above, and the
+# free text is kept as a few short samples so a diagnosis is still possible
+# without the aggregate growing with the number of distinct error strings.
+DELIVERY_SAMPLE_MAX = 3
+DELIVERY_SAMPLE_LEN = 80
+
+
+def clip_text(text: Any, limit: int) -> str:
+    """Truncate to ``limit`` chars with an explicit marker (never silently).
+
+    Public because every surface that bounds one of these strings must bound it
+    the SAME way: the CLI digest used to apply its own unmarked ``[:200]``, which
+    is exactly the "an unmarked cut reads as a complete message" failure this
+    helper exists to prevent."""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - len(_TRUNCATION_MARKER), 0)] + _TRUNCATION_MARKER
+
+
 def delivery_entry(result: Any) -> dict[str, Any]:
     """One ``progress['delivery']`` record for an executed QC/probe op.
 
     The LAST event wins (a multi-post op is summarized by its final post). No
     event at all is recorded as ``no_delivery_event`` — that absence is exactly
-    the "generated but never posted" signal the status API needs to expose."""
+    the "generated but never posted" signal the status API needs to expose.
+
+    ``outcome`` is the machine-readable state; ``skipped_reason`` stays the
+    human-readable detail (kept for the existing failure-tail surfaces)."""
     events = extract_delivery_events(result)
     if not events:
-        return {"status": None, "skipped_reason": "no_delivery_event"}
+        return {
+            "status": None,
+            "outcome": DELIVERY_OUTCOME_NO_EVENT,
+            "skipped_reason": DELIVERY_OUTCOME_NO_EVENT,
+        }
     last = events[-1]
     if last.get("event") == "discord_post_skipped":
-        return {"status": None, "skipped_reason": str(last.get("reason") or "skipped")}
+        return {
+            "status": None,
+            "outcome": DELIVERY_OUTCOME_SKIPPED,
+            "skipped_reason": clip_text(last.get("reason") or "skipped", DELIVERY_DETAIL_MAX),
+        }
+    if last.get("event") == "discord_post_failed":
+        detail = clip_text(last.get("error") or "", DELIVERY_DETAIL_MAX)
+        return {
+            "status": None,
+            "outcome": DELIVERY_OUTCOME_POST_FAILED,
+            "skipped_reason": f"post_failed:{detail}" if detail else "post_failed",
+        }
     status = last.get("status")
-    return {"status": status if isinstance(status, int) else None}
+    if not isinstance(status, int):
+        return {"status": None, "outcome": DELIVERY_OUTCOME_UNKNOWN}
+    if 200 <= status < 300:
+        return {"status": status, "outcome": DELIVERY_OUTCOME_DELIVERED}
+    return {"status": status, "outcome": DELIVERY_OUTCOME_HTTP_ERROR}
+
+
+def delivery_outcome(entry: dict[str, Any]) -> str:
+    """The outcome of one delivery record, from the field when present.
+
+    Records written before ``outcome`` existed (a daemon mid-upgrade, or a
+    progress.json from an older release) are classified from what they DO carry;
+    this is the only place that reads the legacy free-text shape."""
+    outcome = entry.get("outcome")
+    if isinstance(outcome, str) and outcome in DELIVERY_OUTCOMES:
+        return outcome
+    status = entry.get("status")
+    if isinstance(status, int):
+        return (
+            DELIVERY_OUTCOME_DELIVERED
+            if 200 <= status < 300
+            else DELIVERY_OUTCOME_HTTP_ERROR
+        )
+    reason = entry.get("skipped_reason")
+    if not reason:
+        return DELIVERY_OUTCOME_UNKNOWN
+    text = str(reason)
+    if text == DELIVERY_OUTCOME_NO_EVENT:
+        return DELIVERY_OUTCOME_NO_EVENT
+    if text.startswith("post_failed"):
+        return DELIVERY_OUTCOME_POST_FAILED
+    return DELIVERY_OUTCOME_SKIPPED
+
+
+def delivery_confirmed(entry: dict[str, Any]) -> bool:
+    """True only for a CONFIRMED delivery (2xx). Both failure-tail surfaces
+    (`/status`, `kikai remote run`) call this, so "what counts as delivered"
+    — notably: a 3xx does NOT — is defined exactly once."""
+    return delivery_outcome(entry) == DELIVERY_OUTCOME_DELIVERED
+
+
+def _reason_key(outcome: str, entry: dict[str, Any]) -> str:
+    """The `reasons` bucket key — from a FIXED vocabulary, never from free text.
+
+    WHY: the key used to be the whole ``skipped_reason``, so 60 attempts whose
+    error strings carried a path/step produced 60 buckets in a field that
+    /status re-serializes on every long-poll. Cardinality must not depend on
+    what a script happens to print."""
+    if outcome == DELIVERY_OUTCOME_HTTP_ERROR:
+        status = entry.get("status")
+        # bounded by construction: only real HTTP code space gets its own key
+        if isinstance(status, int) and 100 <= status <= 599:
+            return f"http_{status}"
+        return "http_other"
+    return outcome
+
+
+def _reason_sample(outcome: str, entry: dict[str, Any]) -> str | None:
+    """The script-supplied text behind a bucket, if any (kept out of the key)."""
+    if outcome not in (DELIVERY_OUTCOME_SKIPPED, DELIVERY_OUTCOME_POST_FAILED):
+        return None
+    reason = entry.get("skipped_reason")
+    return clip_text(reason, DELIVERY_SAMPLE_LEN) if reason else None
+
+
+def as_mapping(value: Any) -> dict[Any, Any]:
+    """``value`` if it is a mapping, else an empty one.
+
+    progress.json is written by a long-lived daemon and read by the ``/status``
+    hot path; a truncated/hand-edited/older-shape file must degrade to "no
+    information", never to an AttributeError. A summary that CRASHES the status
+    read is strictly worse than the silence this whole change set removed."""
+    return value if isinstance(value, dict) else {}
+
+
+def int_steps(value: Any) -> set[int]:
+    """The distinct int steps in ``value``, tolerating any other shape.
+
+    ``bool`` is an ``int`` in Python but never a step, and a bare string would
+    iterate per character — both are filtered out rather than counted.
+
+    Public for the same reason as ``clip_text``: every surface that turns step
+    bookkeeping into a count (``load_progress``, the ``/status`` denominator,
+    the ``kikai remote run`` digest) must agree on what counts, and must survive
+    the same corrupt shapes. A second local ``len(x or [])`` is precisely how
+    one of them ends up raising on a payload the others tolerate."""
+    if not isinstance(value, (list, tuple, set)):
+        return set()
+    return {s for s in value if isinstance(s, int) and not isinstance(s, bool)}
+
+
+def _delivery_expected(progress: dict[str, Any]) -> int:
+    """How many QC/probe ops actually COMPLETED, per the reconciler's own
+    bookkeeping — the denominator ``progress['delivery']`` is measured against.
+
+    ``record_delivery`` is skipped on the idempotent-replay paths (a crash
+    restart re-runs an already-recorded QC/probe), so a run can legitimately
+    have 60 QC steps and 0 delivery records. Counting only the records makes
+    that read as ``total: 0`` — silence, in the exact field the operator was
+    told to check first."""
+    progress = as_mapping(progress)
+    expected = len(int_steps(progress.get("qc_done_steps")))
+    for steps in as_mapping(progress.get("probes_done_steps")).values():
+        expected += len(int_steps(steps))
+    return expected
+
+
+def delivery_summary(progress: dict[str, Any]) -> dict[str, Any]:
+    """Counts over the WHOLE ``progress['delivery']`` map, per outcome.
+
+    WHY (2026-07-25 incident): every read surface showed only a truncated TAIL of
+    the delivery failures (status API: last 20, CLI digest: last 5) with no
+    denominator, so "60 of 60 QC posts unverified" was indistinguishable from
+    "a few recent hiccups" and went unnoticed for ~11 days across 5 runs. A tail
+    without a total cannot express scale; this is the denominator.
+
+    Shape (``delivered + failed + skipped + unverified == total``,
+    ``total + unrecorded == expected``)::
+
+        total       records in progress['delivery']
+        expected    QC/probe ops the reconciler completed (see _delivery_expected)
+        unrecorded  completed ops with NO record at all — also unverified, but
+                    counted apart because the cause is different (replay path /
+                    a daemon predating delivery recording)
+        delivered   confirmed 2xx
+        failed      CONFIRMED not delivered (non-2xx, or the post raised)
+        skipped     deliberately not posted (the script said so)
+        unverified  cannot confirm either way (no delivery event / unusable one)
+        reasons     fixed-vocabulary bucket -> count
+        reason_samples  bucket -> a few short script-supplied strings
+
+    ``failed`` and ``unverified`` are deliberately NOT one number: "the post
+    failed" and "kikai cannot tell" are different incidents with different
+    owners (see SKILL.md).
+
+    Total-function by contract: any shape of ``progress`` (truncated JSON, an
+    older schema, a hand-edited file) yields counts, never an exception — this
+    runs on the ``/status`` hot path, where a raising summary would take the
+    whole status read down with it."""
+    counts = {
+        DELIVERY_OUTCOME_DELIVERED: 0,
+        DELIVERY_OUTCOME_HTTP_ERROR: 0,
+        DELIVERY_OUTCOME_POST_FAILED: 0,
+        DELIVERY_OUTCOME_SKIPPED: 0,
+        DELIVERY_OUTCOME_NO_EVENT: 0,
+        DELIVERY_OUTCOME_UNKNOWN: 0,
+    }
+    reasons: dict[str, int] = {}
+    samples: dict[str, list[str]] = {}
+    total = 0
+    for entry in as_mapping(as_mapping(progress).get("delivery")).values():
+        if not isinstance(entry, dict):
+            continue
+        total += 1
+        outcome = delivery_outcome(entry)
+        counts[outcome] += 1
+        if outcome == DELIVERY_OUTCOME_DELIVERED:
+            continue
+        key = _reason_key(outcome, entry)
+        reasons[key] = reasons.get(key, 0) + 1
+        sample = _reason_sample(outcome, entry)
+        if sample is not None:
+            bucket = samples.setdefault(key, [])
+            if sample not in bucket and len(bucket) < DELIVERY_SAMPLE_MAX:
+                bucket.append(sample)
+    expected = max(_delivery_expected(progress), total)
+    return {
+        "total": total,
+        "expected": expected,
+        "unrecorded": expected - total,
+        "delivered": counts[DELIVERY_OUTCOME_DELIVERED],
+        "failed": counts[DELIVERY_OUTCOME_HTTP_ERROR] + counts[DELIVERY_OUTCOME_POST_FAILED],
+        "skipped": counts[DELIVERY_OUTCOME_SKIPPED],
+        "unverified": counts[DELIVERY_OUTCOME_NO_EVENT] + counts[DELIVERY_OUTCOME_UNKNOWN],
+        "reasons": reasons,
+        "reason_samples": samples,
+    }
 
 
 def record_delivery(progress: dict[str, Any], key: str, result: Any) -> None:

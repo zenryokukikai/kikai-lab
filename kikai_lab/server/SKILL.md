@@ -135,12 +135,62 @@ milestone anchors — they survive outside the rolling windows:
 `/status` carries the reconciler's whole progress digest, not just
 `qc_done_steps`: `probes_done_steps` (per probe id), `op_fail_counts` /
 `op_gave_up` (consecutive failures and permanently-skipped steps, keyed
-`qc:<step>` / `probe:<id>:<step>`), `last_error`, and `delivery_failures` —
-the recent QC/probe delivery outcomes that were NOT a 2xx post: explicit
-skips (`skipped_reason`), failed posts (`status`), or ops that emitted no
-delivery event at all (`no_delivery_event`). "The video rendered but never
-arrived" is answered here; `kikai remote run <proj> <run>` prints the same
-digest.
+`qc:<step>` / `probe:<id>:<step>`), `last_error`, `delivery_summary` and
+`delivery_failures`. "The video rendered but never arrived" is answered here;
+`kikai remote run <proj> <run>` prints the same digest.
+
+- **`delivery_summary` first** — counts over EVERY recorded outcome, plus the
+  denominator they are measured against. `delivery_failures` is only the last 20
+  (CLI: 5), and a tail has no denominator: `0/60 delivered` and "2 recent
+  hiccups" looked identical until this field existed.
+
+  ```json
+  {"total": 60, "expected": 60, "unrecorded": 0,
+   "delivered": 0, "failed": 0, "skipped": 0, "unverified": 60,
+   "reasons": {"no_delivery_event": 60}, "reason_samples": {}}
+  ```
+
+  `delivered + failed + skipped + unverified == total`, and
+  `total + unrecorded == expected`. Read them as four DIFFERENT incidents:
+  - `failed` — **confirmed not delivered** (non-2xx answer, or the post raised).
+    Fix the webhook/network; the run's QC did render.
+  - `skipped` — the script deliberately did not post (e.g. no webhook configured).
+  - `unverified` — kikai **cannot confirm or deny** the post: the op emitted no
+    delivery event (`no_delivery_event`), or an unusable one (`unknown`). Not a
+    failure; it usually means the script does not implement the contract below.
+    *Vintage caveat:* a post that RAISED was recorded as `no_delivery_event` by
+    daemons predating this release, so old records read as `unverified` while
+    the identical event recorded today reads as `failed` (`post_failed`). Rows
+    written before the upgrade are not re-classified — when a run straddles it,
+    compare `unverified` against the run's start date before concluding "the
+    script emits no events".
+  - `unrecorded` — the op completed (it is in `qc_done_steps` /
+    `probes_done_steps`) but produced no delivery record at all: an idempotent
+    replay after a crash-restart, or a run started under a daemon that predates
+    delivery recording. Also unverified, different cause.
+- `reasons` is keyed by a FIXED vocabulary (so its size never depends on what a
+  script prints): `skipped`, `post_failed`, `http_<code>` / `http_other`,
+  `no_delivery_event`, `unknown`. The script-supplied text lives in
+  `reason_samples` (up to 3 distinct strings per bucket, 80 chars each) and in
+  full-ish form (160 chars, `…`-marked when cut) on the per-step
+  `delivery_failures` rows, which also carry the same explicit `outcome`.
+  `kikai remote run` prints those rows compactly as `key=outcome(status):detail`
+  (JSON spent the whole line budget on quotes and field names).
+
+**Delivery-event contract for QC/probe scripts.** A script that posts an
+artifact itself (rather than via a `deliver`/`artifact_delivery` op step) MUST
+print exactly one JSON line per post attempt on stdout, or its delivery is
+invisible to every kikai read surface:
+
+```
+{"event": "discord_post", "status": 200}            # posted (status = HTTP code)
+{"event": "discord_post_skipped", "reason": "..."}  # deliberately not posted
+{"event": "discord_post_failed", "error": "..."}    # attempted, raised
+```
+
+Putting the HTTP status inside the script's own result object (e.g.
+`{"event": "my_diag", "http": 200}`) does NOT count — the parser keys on the
+three event names above.
 
 ## Iterating: submit-from (differential submission)
 
