@@ -37,6 +37,16 @@ pre-1.0, so minor versions may contain breaking API changes.
   text/JSON content (`tail=true` for file tails; binary files return
   metadata only). CLI: `kikai remote artifacts <project> <run>
   [--path d --depth N | --file rel --tail]`.
+- **Run purge (`POST .../runs/{run}/artifacts/purge`)**: kikai empties a
+  finished run's run_dir itself, so the deletion is checked against its own
+  records rather than racing them. Dry-run by default (`would_delete[]` +
+  `total_bytes`); `keep` defaults to `metrics.jsonl` / `tensorboard`; refused
+  with 409 while the run is non-terminal (`run.purge_active_refused`) or still
+  has queued qc_op/probe work (`run.purge_qc_pending_refused` — the same
+  `pending_qc_steps` predicate that protects checkpoints from retention);
+  symlinks out of the run_dir are skipped, never followed. The purge is
+  recorded as an appended `kind: purge` ledger row plus a journal entry. CLI:
+  `kikai remote purge <project> <run> [--yes] [--keep NAME ...]`.
 - `GET .../runs/{run}/status` now exposes the full reconciler progress
   digest: `probes_done_steps`, `op_fail_counts`, `op_gave_up`, `last_error`,
   and recent `delivery_failures`.

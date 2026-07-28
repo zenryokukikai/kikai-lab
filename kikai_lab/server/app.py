@@ -27,7 +27,10 @@ logger = logging.getLogger("kikai_lab.server")
 # HTTP statuses by OperationError code convention. Tails are checked both bare
 # ("data_source.exists") and suffixed ("operation.script_bundle_run_name_in_use").
 _NOT_FOUND_TAILS = ("missing", "not_found")
-_CONFLICT_TAILS = ("exists", "in_use", "archived", "not_local")
+# "refused": a destructive domain operation blocked by the run's CURRENT state
+# (still running, QC still queued) — a state conflict, not a malformed request:
+# the same call succeeds once the state changes, so 409, never 400/422.
+_CONFLICT_TAILS = ("exists", "in_use", "archived", "not_local", "refused")
 _FORBIDDEN_TAILS = ("forbidden",)
 _UNPROCESSABLE_TAILS = ("invalid", "unknown", "unverified", "incompatible")
 _TIMEOUT_TAILS = ("timeout",)
@@ -287,6 +290,7 @@ def create_app(config: ServerConfig) -> FastAPI:
     from kikai_lab.server.projects import build_projects_router
     from kikai_lab.server.resources import build_resources_router
     from kikai_lab.server.run_files import build_run_files_router
+    from kikai_lab.server.run_purge import build_run_purge_router
     from kikai_lab.server.runs import build_runs_router
     from kikai_lab.server.submit import build_submit_router
 
@@ -294,6 +298,7 @@ def create_app(config: ServerConfig) -> FastAPI:
     app.include_router(build_resources_router(config), prefix="/v1")
     app.include_router(build_runs_router(config), prefix="/v1")
     app.include_router(build_run_files_router(config), prefix="/v1")
+    app.include_router(build_run_purge_router(config), prefix="/v1")
     app.include_router(build_artifacts_router(config), prefix="/v1")
     app.include_router(build_bundles_router(config), prefix="/v1")
     app.include_router(build_submit_router(config), prefix="/v1")

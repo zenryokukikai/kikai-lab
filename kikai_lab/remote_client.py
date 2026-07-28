@@ -15,6 +15,7 @@ Subcommands::
   kikai remote metrics <project> <run> --keys a,b    # first/quartile/last trend
   kikai remote artifacts <project> <run> [--path d]  # run_dir listing (ssh-free)
   kikai remote artifacts <project> <run> --file f    # small text file content
+  kikai remote purge <project> <run> [--yes]         # free the run_dir (dry-run by default)
   kikai remote op <project> --file req.json          # run op; script events auto-extracted
   kikai remote submit-from <project> <run> <parent> --overrides-file f.json
   kikai remote stop <project> <run>
@@ -325,6 +326,40 @@ def cmd_artifacts(args: argparse.Namespace) -> int:
     total = d.get("total", 0)
     if env.get("ok"):
         print(f"total={total}" + (" (truncated)" if d.get("truncated") else ""))
+    for line in _err_lines(env):
+        print(line)
+    return 0 if env.get("ok") else 1
+
+
+def cmd_purge(args: argparse.Namespace) -> int:
+    """Free a finished run's run_dir. DRY-RUN unless ``--yes``: the plan is printed
+    first because the numbers (what, how many bytes) are the whole decision."""
+    body: dict[str, Any] = {"dry_run": not args.yes}
+    if args.keep is not None:
+        body["keep"] = args.keep
+    env = _http(
+        "POST",
+        f"{_base_url(args)}/v1/projects/{args.project}/runs/{args.run}/artifacts/purge",
+        body,
+    )
+    if args.json:
+        return _print_json(env)
+    d = env.get("data") or {}
+    dry = d.get("dry_run", True)
+    rows = (d.get("would_delete") if dry else d.get("deleted")) or []
+    for e in rows:
+        print(f"{'d' if e.get('is_dir') else 'f'} {e.get('bytes', 0):>14} {e.get('path')}")
+    # skipped/failed are printed even on success: an entry that survived a purge is
+    # exactly what an operator counting freed bytes must not have to go looking for.
+    for s in (d.get("skipped") or []) + (d.get("failed") or []):
+        print(f"! {'-':>14} {s.get('path')} ({s.get('reason')})")
+    if env.get("ok"):
+        verb = "would_delete" if dry else "deleted"
+        line = (
+            f"ok=True {verb}={len(rows)} total_bytes={d.get('total_bytes', 0)} "
+            f"kept={','.join(d.get('keep') or []) or '-'}"
+        )
+        print(line + (" (dry-run; pass --yes to delete)" if dry else ""))
     for line in _err_lines(env):
         print(line)
     return 0 if env.get("ok") else 1
@@ -654,6 +689,19 @@ def command_remote(argv: list[str]) -> int:
     s.add_argument("--tail", action="store_true", help="last max-bytes of --file")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_artifacts)
+
+    s = sub.add_parser("purge")
+    s.add_argument("project")
+    s.add_argument("run")
+    s.add_argument("--yes", action="store_true", help="actually delete (default: dry-run)")
+    s.add_argument(
+        "--keep",
+        nargs="*",
+        default=None,
+        help="names under the run_dir to keep (default: metrics.jsonl tensorboard)",
+    )
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_purge)
 
     s = sub.add_parser("op")
     s.add_argument("project")

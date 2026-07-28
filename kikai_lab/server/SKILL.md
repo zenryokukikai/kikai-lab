@@ -365,6 +365,35 @@ curl -X POST $BASE/projects/example_proj/runs/example_run_001/qc-config \
   want its integrity verified at submit time. `resume.fresh_no_resume` is a registry
   annotation for validation, not a launch parameter.
 
+## Freeing disk (run purge)
+
+`POST .../runs/{run}/artifacts/purge` empties a FINISHED run's run_dir — kikai
+deletes it, so the deletion is checked against kikai's own records instead of
+racing them. Body (both optional):
+
+```json
+{"dry_run": true, "keep": ["metrics.jsonl", "tensorboard"]}
+```
+
+- `dry_run` defaults to **true**: you get `would_delete[]` (`path`, `bytes`,
+  `is_dir`, `file_count`) and `total_bytes`, and nothing is touched. Send
+  `{"dry_run": false}` to delete.
+- `keep` is a list of names directly under the run_dir and REPLACES the default
+  (`metrics.jsonl`, `tensorboard`) — the evidence, not the bulk.
+- Refused with 409 while the run is still kikai's: `run.purge_active_refused`
+  (derived status is `running`/`submitted`/`exited_pending_finalize` — stop and
+  finalize first) or `run.purge_qc_pending_refused` (checkpoints still have
+  queued qc_op/probe work; `details.pending_qc_steps` names them). The same
+  predicate protects them from retention.
+- Symlinks pointing outside the run_dir are never followed: they come back in
+  `skipped[]` and both the link and its target survive.
+- The purge is recorded: a `kind: purge` row is APPENDED to the run's artifact
+  ledger (existing rows are never rewritten) and a `run_artifacts_purged` entry
+  lands in the journal.
+
+CLI: `kikai remote purge <project> <run>` (dry-run) → add `--yes` to delete,
+`--keep NAME ...` to change what survives.
+
 ## Error codes you will actually see
 
 | code (tail) | HTTP | meaning → action |
@@ -374,6 +403,7 @@ curl -X POST $BASE/projects/example_proj/runs/example_run_001/qc-config \
 | `project.archived` | 409 | unarchive first (`POST .../unarchive`) |
 | `operation.host_not_local` | 409 | this server only launches locally in v1 |
 | `*_in_use` | 409 | container name already held — `details.next` points at the stop call |
+| `*_refused` | 409 | destructive op blocked by the run's current state → finish/finalize it, then retry |
 | `*_invalid` (incl. schema 422s) | 422 | your body — `details.validation_errors` lists paths |
 | `*_unverified` | 422 | input failed integrity re-check → re-register or investigate |
 | `artifact.content_root_forbidden` | 403 | server has no `--content-root` for that file |
