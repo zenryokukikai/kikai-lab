@@ -14,7 +14,7 @@ Implement the remote/detached adapters in `kikai_lab/operation.py`:
 - `docker_container_restart` — force-remove a named container resolved from `containers/<container_id>.yaml`; with `mode: restart` re-run a `status: service` container detached.
 - `remote_file_push` / `remote_file_fetch` — scp local↔remote (dirs via `scp -r`).
 - `remote_docker_build` — build a docker image on the remote host from an inline `dockerfile_content` piped over ssh.
-- `remote_docker_run` — one-off `docker run --rm <image> <argv...>` on the remote host.
+- `remote_docker_run` — one-off `docker run --rm <image> <argv...>` on the remote host; with `detach: true` a long-lived `docker run -d` service container (no `--rm`, `name` required) with optional `ports` publishing.
 - `tensorboard_service` — `status` / `ensure-running` for a TensorBoard container.
 
 Out of scope: live log streaming, multi-host orchestration, retry/backoff, scheduling.
@@ -23,7 +23,7 @@ Out of scope: live log streaming, multi-host orchestration, retry/backoff, sched
 
 Every remote adapter validates `ssh_host` with `require_safe_ssh_host`: strict charset and an explicit reject of a leading `-` (an ssh/scp arg starting with `-` is parsed as an option, e.g. `-oProxyCommand=...` → local command execution).
 
-- `remote_docker_run`: `gpus` matched against `all`/`none`/`<int>`/`device=<ids>`; `image`, `network`, `name`, `workdir`, `volumes` regex-validated; env keys regex-validated, env values `shlex`-quoted; `command` is a list of argv strings, each `shlex`-quoted.
+- `remote_docker_run`: `gpus` matched against `all`/`none`/`<int>`/`device=<ids>`; `image`, `network`, `name`, `workdir`, `volumes` regex-validated; env keys regex-validated, env values `shlex`-quoted; `command` is a list of argv strings, each `shlex`-quoted. `ports` entries must be plain `host:container` port pairs (no bind address), and `detach: true` requires `name` so the container stays tearable-down.
 - `remote_docker_teardown`: `name_pattern` matched with `re.fullmatch` (anchored, whole-name) and length-capped at 200; each selected name re-checked against the safe-name regex before removal.
 - `remote_docker_build`: `image_tag` and `remote_build_dir` regex-validated; `build_args` keys regex-validated and each `k=v` token `shlex`-quoted.
 - Remote dest/build/workdir paths must match a safe absolute-path regex and contain no `..` segments.
