@@ -760,7 +760,10 @@ def execute_remote_docker_teardown_operation(request: dict[str, Any]) -> dict[st
             if not _SAFE_CONTAINER_NAME.match(name):
                 results.append({"name": name, "skipped": "unsafe_name"})
                 continue
-            rm = subprocess.run([ssh_bin, ssh_host, f"docker rm -f {name}"], check=False, text=True, capture_output=True)
+            rm = subprocess.run(
+                ["docker", "rm", "-f", name] if local_mode
+                else [ssh_bin, ssh_host, f"docker rm -f {name}"],
+                check=False, text=True, capture_output=True)
             results.append({"name": name, "returncode": rm.returncode, "removed": rm.returncode == 0,
                             "stderr": rm.stderr.strip()[:200] if rm.returncode != 0 else ""})
     return {
