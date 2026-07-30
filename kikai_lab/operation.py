@@ -703,13 +703,15 @@ def execute_remote_docker_teardown_operation(request: dict[str, Any]) -> dict[st
     `docker rm -f` each (unless `list_only`). ssh_host is regex-validated and each selected
     name is re-checked against _SAFE_CONTAINER_NAME before removal. This is the kikai-native
     way to free a GPU held by a dead/orphaned run when TaskStop only killed the local ssh."""
-    ssh_host = require_safe_ssh_host(
-        require_string(
-            request.get("ssh_host"),
-            "operation.remote_ssh_host_missing",
-            "remote_docker_teardown request.ssh_host is required",
-        )
+    # "local" mirrors remote_docker_run: the server host IS the docker host,
+    # so docker is invoked directly (argv, no shell, no ssh).
+    raw_host = require_string(
+        request.get("ssh_host"),
+        "operation.remote_ssh_host_missing",
+        "remote_docker_teardown request.ssh_host is required",
     )
+    local_mode = raw_host == "local"
+    ssh_host = raw_host if local_mode else require_safe_ssh_host(raw_host)
     explicit = request.get("container_names") or []
     if not isinstance(explicit, list):
         raise OperationError("operation.remote_docker_teardown_invalid", "container_names must be a list", {})
@@ -718,8 +720,10 @@ def execute_remote_docker_teardown_operation(request: dict[str, Any]) -> dict[st
     list_only = bool(request.get("list_only"))
     ssh_bin = os.environ.get("KIKAI_SSH_BIN", "ssh")
 
+    ps_fmt = "{{.Names}}|{{.State}}|{{.Status}}|{{.Image}}|{{.RunningFor}}"
     listing = subprocess.run(
-        [ssh_bin, ssh_host, "docker ps -a --format '{{.Names}}|{{.State}}|{{.Status}}|{{.Image}}|{{.RunningFor}}'"],
+        ["docker", "ps", "-a", "--format", ps_fmt] if local_mode
+        else [ssh_bin, ssh_host, f"docker ps -a --format '{ps_fmt}'"],
         check=False, text=True, capture_output=True,
     )
     if listing.returncode != 0:

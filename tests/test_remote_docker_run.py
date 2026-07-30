@@ -394,3 +394,25 @@ def test_remote_docker_run_local_mode_still_validates_ports(monkeypatch):
             "ports": ["18080:8080; rm -rf /"],
         })
     assert e.value.code == "operation.remote_docker_run_invalid_port"
+
+
+def test_remote_docker_teardown_local_mode(monkeypatch):
+    """teardown も ssh_host=local で docker argv を直接実行する (issue #48)。"""
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        if argv[:3] == ["docker", "ps", "-a"]:
+            return _completed(0, "staging-engine|exited|Exited (0) 1m|img|1m\n", "")
+        return _completed(0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    from kikai_lab.operation import execute_remote_docker_teardown_operation
+    result = execute_remote_docker_teardown_operation({
+        "operation": "t", "ssh_host": "local",
+        "container_names": ["staging-engine"],
+    })
+    assert calls[0][:3] == ["docker", "ps", "-a"]
+    assert ["docker", "rm", "-f", "staging-engine"] in calls
+    assert all(a[0] != "ssh" for a in calls)
+    assert result.get("removed") or result.get("execution_status")
