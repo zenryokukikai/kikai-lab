@@ -902,10 +902,13 @@ def execute_remote_docker_build_operation(request: dict[str, Any]) -> dict[str, 
     `pip install` is unnecessary. ssh_host, image_tag and remote_build_dir are
     regex-validated, build_arg keys are regex-validated and each k=v token is shlex-quoted,
     to keep the shell-injection surface minimal."""
-    ssh_host = require_safe_ssh_host(
-        require_string(request.get("ssh_host"), "operation.remote_ssh_host_missing",
-                       "remote_docker_build request.ssh_host is required")
-    )
+    # "local" mirrors remote_docker_run/teardown (#45/#51): the server host IS the
+    # docker host, so write the Dockerfile and run docker directly (argv, no shell,
+    # no ssh) — self-ssh needs credentials we refuse to plant.
+    raw_host = require_string(request.get("ssh_host"), "operation.remote_ssh_host_missing",
+                              "remote_docker_build request.ssh_host is required")
+    local_mode = raw_host == "local"
+    ssh_host = raw_host if local_mode else require_safe_ssh_host(raw_host)
     image_tag = resolve_text_ref(
         require_string(request.get("image_tag"), "operation.remote_docker_build_tag_missing",
                        "remote_docker_build request.image_tag is required")
@@ -946,26 +949,44 @@ def execute_remote_docker_build_operation(request: dict[str, Any]) -> dict[str, 
     build_args_str = " ".join(build_arg_parts)
     no_cache_flag = "--no-cache" if bool(request.get("no_cache")) else ""
 
-    ssh_bin = os.environ.get("KIKAI_SSH_BIN", "ssh")
-    subprocess.run([ssh_bin, ssh_host, f"mkdir -p {remote_build_dir}"],
-                   check=False, text=True, capture_output=True)
-    write = subprocess.run(
-        [ssh_bin, ssh_host, f"cat > {remote_build_dir}/Dockerfile"],
-        input=dockerfile_content, text=True, capture_output=True, check=False,
-    )
-    if write.returncode != 0:
-        raise OperationError("operation.remote_docker_build_dockerfile_write_failed",
-                             "remote_docker_build failed to write Dockerfile to remote",
-                             {"remote_build_dir": remote_build_dir,
-                              "stderr": (write.stderr or "")[-2000:]})
+    if local_mode:
+        try:
+            os.makedirs(remote_build_dir, exist_ok=True)
+            with open(os.path.join(remote_build_dir, "Dockerfile"), "w") as fh:
+                fh.write(dockerfile_content)
+        except OSError as exc:
+            raise OperationError("operation.remote_docker_build_dockerfile_write_failed",
+                                 "remote_docker_build failed to write Dockerfile locally",
+                                 {"remote_build_dir": remote_build_dir, "stderr": str(exc)[-2000:]})
+        build_argv = ["docker", "build"]
+        if no_cache_flag:
+            build_argv.append("--no-cache")
+        for k, v in build_args.items():
+            build_argv += ["--build-arg", f"{k}={resolve_text_ref(str(v))}"]
+        build_argv += ["-t", image_tag, "-f", os.path.join(remote_build_dir, "Dockerfile"),
+                       remote_build_dir]
+        build = subprocess.run(build_argv, text=True, capture_output=True, check=False)
+    else:
+        ssh_bin = os.environ.get("KIKAI_SSH_BIN", "ssh")
+        subprocess.run([ssh_bin, ssh_host, f"mkdir -p {remote_build_dir}"],
+                       check=False, text=True, capture_output=True)
+        write = subprocess.run(
+            [ssh_bin, ssh_host, f"cat > {remote_build_dir}/Dockerfile"],
+            input=dockerfile_content, text=True, capture_output=True, check=False,
+        )
+        if write.returncode != 0:
+            raise OperationError("operation.remote_docker_build_dockerfile_write_failed",
+                                 "remote_docker_build failed to write Dockerfile to remote",
+                                 {"remote_build_dir": remote_build_dir,
+                                  "stderr": (write.stderr or "")[-2000:]})
 
-    build_cmd = (
-        f"docker build {no_cache_flag} {build_args_str} -t {image_tag} "
-        f"-f {remote_build_dir}/Dockerfile {remote_build_dir}"
-    )
-    build = subprocess.run(
-        [ssh_bin, ssh_host, build_cmd], text=True, capture_output=True, check=False
-    )
+        build_cmd = (
+            f"docker build {no_cache_flag} {build_args_str} -t {image_tag} "
+            f"-f {remote_build_dir}/Dockerfile {remote_build_dir}"
+        )
+        build = subprocess.run(
+            [ssh_bin, ssh_host, build_cmd], text=True, capture_output=True, check=False
+        )
     stdout = build.stdout or ""
     stderr = build.stderr or ""
     if build.returncode != 0:
