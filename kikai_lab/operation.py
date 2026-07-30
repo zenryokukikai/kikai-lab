@@ -988,10 +988,12 @@ def execute_remote_docker_run_operation(request: dict[str, Any]) -> dict[str, An
     ports and env keys are all regex-validated (and env values are shlex-quoted).
     With `detach: true` this instead starts a long-lived service container (`docker run -d`,
     no `--rm`) and returns its container id; `ports` publishes host:container port pairs."""
-    ssh_host = require_safe_ssh_host(
-        require_string(request.get("ssh_host"), "operation.remote_ssh_host_missing",
-                       "remote_docker_run request.ssh_host is required")
-    )
+    # "local": the kikai server host IS the target host, so run docker directly
+    # (argv list, no shell, no ssh) — self-ssh needs credentials we refuse to plant.
+    raw_host = require_string(request.get("ssh_host"), "operation.remote_ssh_host_missing",
+                              "remote_docker_run request.ssh_host is required")
+    local_mode = raw_host == "local"
+    ssh_host = raw_host if local_mode else require_safe_ssh_host(raw_host)
     image = resolve_text_ref(
         require_string(request.get("image"), "operation.remote_docker_run_image_missing",
                        "remote_docker_run request.image is required")
@@ -1110,10 +1112,33 @@ def execute_remote_docker_run_operation(request: dict[str, Any]) -> dict[str, An
     parts.extend(shlex.quote(c) for c in command)
     remote_cmd = " ".join(parts)
 
-    ssh_bin = os.environ.get("KIKAI_SSH_BIN", "ssh")
+    if local_mode:
+        # Same validated pieces, assembled as a real argv list: nothing ever
+        # passes through a shell. The remote string path below is untouched.
+        argv: list[str] = ["docker", "run", "-d" if detach else "--rm"]
+        if gpus:
+            argv += ["--gpus", gpus]
+        if network:
+            argv += ["--network", network]
+        if name:
+            argv += ["--name", name]
+        if workdir:
+            argv += ["-w", workdir]
+        for k, v in env.items():
+            argv += ["-e", f"{k}={resolve_text_ref(str(v))}"]
+        for vol in volumes:
+            argv += ["-v", resolve_text_ref(str(vol))]
+        for port in ports:
+            argv += ["-p", resolve_text_ref(str(port))]
+        argv.append(image)
+        argv.extend(command)
+        exec_argv = argv
+    else:
+        ssh_bin = os.environ.get("KIKAI_SSH_BIN", "ssh")
+        exec_argv = [ssh_bin, ssh_host, remote_cmd]
     try:
         run = subprocess.run(
-            [ssh_bin, ssh_host, remote_cmd], text=True, capture_output=True, timeout=timeout_sec
+            exec_argv, text=True, capture_output=True, timeout=timeout_sec
         )
     except subprocess.TimeoutExpired as exc:
         raise OperationError("operation.remote_docker_run_timeout",

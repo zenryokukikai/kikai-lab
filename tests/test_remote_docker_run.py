@@ -338,3 +338,59 @@ def test_remote_docker_run_shell_quotes_command_argv(monkeypatch):
     assert "'echo hi; rm -rf /'" in remote
     # And the raw (unquoted) injection must NOT appear verbatim outside the quotes.
     assert remote.endswith("example-engine:dev bash -lc 'echo hi; rm -rf /'")
+
+
+
+
+def _fail_if_called(monkeypatch):
+    def fail(*a, **k):
+        raise AssertionError("subprocess.run must not be reached")
+    return fail
+
+def test_remote_docker_run_local_mode_runs_argv_without_ssh(monkeypatch):
+    """ssh_host=local は ssh を介さず docker argv を直接実行する (issue #48)。"""
+    calls = {}
+
+    def fake_run(argv, text, capture_output, timeout):
+        calls["argv"] = argv
+        calls["timeout"] = timeout
+        return _completed(0, "abc123\n", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = execute_remote_docker_run_operation({
+        "operation": "local-op",
+        "ssh_host": "local",
+        "image": "example-engine:dev",
+        "detach": True,
+        "name": "staging-engine",
+        "gpus": "all",
+        "ports": ["18080:8080"],
+        "volumes": ["/h/data:/c/data:ro"],
+        "env": {"MAX_SESSIONS": "16"},
+        "workdir": "/workspace",
+        "command": ["uvicorn", "app:api"],
+        "timeout_sec": 60,
+    })
+    argv = calls["argv"]
+    assert argv[0] == "docker" and "ssh" not in argv[0]
+    assert argv[:3] == ["docker", "run", "-d"]
+    assert "--rm" not in argv
+    assert ["-e", "MAX_SESSIONS=16"] == argv[argv.index("-e"):argv.index("-e") + 2]
+    assert ["-p", "18080:8080"] == argv[argv.index("-p"):argv.index("-p") + 2]
+    assert ["-v", "/h/data:/c/data:ro"] == argv[argv.index("-v"):argv.index("-v") + 2]
+    assert argv[-3:] == ["example-engine:dev", "uvicorn", "app:api"]
+    assert result["container_id"] == "abc123"
+
+
+def test_remote_docker_run_local_mode_still_validates_ports(monkeypatch):
+    """local モードでも ports/volumes 検証は remote と同一に通る。"""
+    monkeypatch.setattr(subprocess, "run", _fail_if_called(monkeypatch))
+    with pytest.raises(OperationError) as e:
+        execute_remote_docker_run_operation({
+            "operation": "local-op",
+            "ssh_host": "local",
+            "image": "example-engine:dev",
+            "command": ["true"],
+            "ports": ["18080:8080; rm -rf /"],
+        })
+    assert e.value.code == "operation.remote_docker_run_invalid_port"
