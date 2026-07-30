@@ -937,6 +937,7 @@ def execute_remote_docker_build_operation(request: dict[str, Any]) -> dict[str, 
         raise OperationError("operation.remote_docker_build_invalid_build_args",
                              "remote_docker_build build_args must be a dict of str->str",
                              {})
+    build_arg_pairs: list[tuple[str, str]] = []
     build_arg_parts: list[str] = []
     for k, v in build_args.items():
         ks = str(k)
@@ -945,6 +946,7 @@ def execute_remote_docker_build_operation(request: dict[str, Any]) -> dict[str, 
                                  "remote_docker_build build_arg key is not a safe name",
                                  {"key": ks})
         vs = resolve_text_ref(str(v))
+        build_arg_pairs.append((ks, vs))
         build_arg_parts.append(f"--build-arg {shlex.quote(f'{ks}={vs}')}")
     build_args_str = " ".join(build_arg_parts)
     no_cache_flag = "--no-cache" if bool(request.get("no_cache")) else ""
@@ -961,8 +963,8 @@ def execute_remote_docker_build_operation(request: dict[str, Any]) -> dict[str, 
         build_argv = ["docker", "build"]
         if no_cache_flag:
             build_argv.append("--no-cache")
-        for k, v in build_args.items():
-            build_argv += ["--build-arg", f"{k}={resolve_text_ref(str(v))}"]
+        for ks, vs in build_arg_pairs:
+            build_argv += ["--build-arg", f"{ks}={vs}"]
         build_argv += ["-t", image_tag, "-f", os.path.join(remote_build_dir, "Dockerfile"),
                        remote_build_dir]
         build = subprocess.run(build_argv, text=True, capture_output=True, check=False)
