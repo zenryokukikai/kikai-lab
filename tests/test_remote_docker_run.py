@@ -168,6 +168,152 @@ def test_remote_docker_run_rejects_option_like_ssh_host(monkeypatch):
     assert exc.value.code == "operation.remote_ssh_host_invalid"
 
 
+def test_remote_docker_run_detached_service_command(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append({"cmd": cmd, "kwargs": kwargs})
+        return _completed(returncode=0, stdout="c0ffee1234567890\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    request = {
+        "adapter": "remote_docker_run",
+        "operation": "staging_engine",
+        "ssh_host": "training-host.example",
+        "image": "example-engine:dev",
+        "command": ["uvicorn", "app:api", "--port", "8080"],
+        "gpus": "all",
+        "name": "staging-engine",
+        "detach": True,
+        "ports": ["18080:8080", "19090:9090"],
+        "volumes": ["/h:/c"],
+        "timeout_sec": 60,
+    }
+
+    result = execute_remote_docker_run_operation(request)
+
+    remote = calls[0]["cmd"][2]
+    assert remote == (
+        "docker run -d --gpus all --name staging-engine -v /h:/c "
+        "-p 18080:8080 -p 19090:9090 example-engine:dev uvicorn app:api --port 8080"
+    )
+    # A detached service container must survive exit, so --rm must NOT be present.
+    assert "--rm" not in remote
+    # The timeout only bounds the start-up confirmation of the detached run.
+    assert calls[0]["kwargs"].get("timeout") == 60
+    assert result["detach"] is True
+    assert result["container_id"] == "c0ffee1234567890"
+    assert result["container_name"] == "staging-engine"
+
+
+def test_remote_docker_run_detach_requires_name(monkeypatch):
+    def fake_run(cmd, *args, **kwargs):  # pragma: no cover - must not be called
+        raise AssertionError("subprocess.run must not run for a detached run without a name")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    request = {
+        "adapter": "remote_docker_run",
+        "operation": "staging_engine_noname",
+        "ssh_host": "training-host.example",
+        "image": "example-engine:dev",
+        "command": ["uvicorn", "app:api"],
+        "detach": True,
+        "ports": ["18080:8080"],
+    }
+
+    with pytest.raises(OperationError) as exc:
+        execute_remote_docker_run_operation(request)
+    assert exc.value.code == "operation.remote_docker_run_name_required"
+
+
+@pytest.mark.parametrize(
+    "bad_port",
+    ["8080", "abc:80", "80:80:80", "", "127.0.0.1:18080:8080", "18080:8080; rm -rf /",
+     "18080:8080\n", "1:80", "184080:8080"],
+)
+def test_remote_docker_run_rejects_invalid_port(monkeypatch, bad_port):
+    def fake_run(cmd, *args, **kwargs):  # pragma: no cover - must not be called
+        raise AssertionError("subprocess.run must not run for an invalid port")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    request = {
+        "adapter": "remote_docker_run",
+        "operation": "staging_engine_bad_port",
+        "ssh_host": "training-host.example",
+        "image": "example-engine:dev",
+        "command": ["uvicorn", "app:api"],
+        "name": "staging-engine",
+        "detach": True,
+        "ports": [bad_port],
+    }
+
+    with pytest.raises(OperationError) as exc:
+        execute_remote_docker_run_operation(request)
+    assert exc.value.code == "operation.remote_docker_run_invalid_port"
+    assert exc.value.details["port"] == bad_port
+
+
+def test_remote_docker_run_rejects_non_list_ports(monkeypatch):
+    def fake_run(cmd, *args, **kwargs):  # pragma: no cover - must not be called
+        raise AssertionError("subprocess.run must not run for non-list ports")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    request = {
+        "adapter": "remote_docker_run",
+        "operation": "staging_engine_bad_ports",
+        "ssh_host": "training-host.example",
+        "image": "example-engine:dev",
+        "command": ["uvicorn", "app:api"],
+        "name": "staging-engine",
+        "detach": True,
+        "ports": "18080:8080",
+    }
+
+    with pytest.raises(OperationError) as exc:
+        execute_remote_docker_run_operation(request)
+    assert exc.value.code == "operation.remote_docker_run_invalid_ports"
+
+
+def test_remote_docker_run_non_detached_command_is_unchanged(monkeypatch):
+    """Regression guard: the argv of the pre-existing (one-off, --rm) path must not
+    change by a single character now that detach/ports exist."""
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append({"cmd": cmd, "kwargs": kwargs})
+        return _completed(returncode=0, stdout="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    request = {
+        "adapter": "remote_docker_run",
+        "operation": "bench_all_opts",
+        "ssh_host": "training-host.example",
+        "image": "example-engine:dev",
+        "command": ["nvidia-smi", "-L"],
+        "gpus": "device=0,1",
+        "network": "host",
+        "name": "bench-1",
+        "workdir": "/work",
+        "env": {"K": "V", "K2": "v 2"},
+        "volumes": ["/h:/c", "/h2:/c2:ro"],
+    }
+
+    result = execute_remote_docker_run_operation(request)
+
+    assert calls[0]["cmd"][2] == (
+        "docker run --rm --gpus device=0,1 --network host --name bench-1 -w /work "
+        "-e K=V -e K2='v 2' -v /h:/c -v /h2:/c2:ro example-engine:dev nvidia-smi -L"
+    )
+    # No detach-only keys leak into the one-off result payload.
+    assert "detach" not in result
+    assert "container_id" not in result
+
+
 def test_remote_docker_run_shell_quotes_command_argv(monkeypatch):
     calls = []
 
