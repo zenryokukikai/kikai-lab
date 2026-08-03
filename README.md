@@ -609,7 +609,7 @@ Long-running training runs on a separate GPU host. Kikai owns that lifecycle thr
 | `remote_file_push` | Push local files/dirs to the remote host over scp (dirs use `scp -r`). Used to sync the kikai-lab package to the remote checkout so `remote_kikai_exec` runs the latest adapters. |
 | `remote_file_fetch` | Pull remote files back to a local destination root over scp. |
 | `remote_docker_build` | Build a docker image on the remote host; the full Dockerfile is supplied inline (`dockerfile_content`) and piped over ssh. Bakes a derived training image so per-run `pip install` is unnecessary. |
-| `remote_docker_run` | One-off `docker run --rm` of a given image plus an argv `command` list on the remote host (benchmarks, NGC containers) without a kikai checkout there. |
+| `remote_docker_run` | One-off `docker run --rm` of a given image plus an argv `command` list on the remote host (benchmarks, NGC containers) without a kikai checkout there. With `detach: true` it instead starts a long-lived service container (`docker run -d`, no `--rm`, `name` required) and returns its container id; `ports: ["18080:8080"]` publishes host:container port pairs. |
 | `tensorboard_service` | `status` / `ensure-running` for a TensorBoard container resolved from `containers/<container_id>.yaml`; (re)starts it detached when the port/logdir does not match. |
 | `remote_kikai_exec` | Ship a bounded local Kikai project payload to the remote host and run a local operation template there (see [One-command launch](#one-command-launch)). |
 
@@ -617,13 +617,51 @@ Long-running training runs on a separate GPU host. Kikai owns that lifecycle thr
 
 These adapters interpolate values into a remote shell, so the request fields are validated before any subprocess runs (claims below match the code exactly):
 
-- `ssh_host` is validated in **every** remote adapter: it must match a strict charset and must not begin with `-`, because an ssh/scp argument that starts with `-` is parsed as an option (e.g. `-oProxyCommand=...` → local command execution).
-- `remote_docker_run` `gpus` is validated against `all` / `none` / `<int>` / `device=<ids>`; `image`, `network`, `name`, `workdir`, and `volumes` are regex-validated, env keys are regex-validated and env values are `shlex`-quoted, and the `command` is a list of argv strings (each `shlex`-quoted), not a shell string.
+- `ssh_host` is validated in **every** remote adapter: it must match a strict charset and must not begin with `-`, because an ssh/scp argument that starts with `-` is parsed as an option (e.g. `-oProxyCommand=...` → local command execution). The single exception is the literal `local` (see below), which never reaches ssh at all.
+- `remote_docker_run` `gpus` is validated against `all` / `none` / `<int>` / `device=<ids>`; `image`, `network`, `name`, `workdir`, and `volumes` are regex-validated, env keys are regex-validated and env values are `shlex`-quoted, and the `command` is a list of argv strings (each `shlex`-quoted), not a shell string. Each `ports` entry must be a plain `host:container` port pair (no bind address, publishing is `0.0.0.0` only), and a `detach: true` request must carry a `name` so `remote_docker_teardown` can always remove the container it leaves behind.
 - `remote_docker_teardown` `name_pattern` is matched with `re.fullmatch` (anchored — it must match the **whole** container name, not a substring, so e.g. `.` cannot select every container) and is length-capped at 200 chars; each selected name is re-checked against the safe-name regex before `docker rm -f`.
 - `remote_docker_build` `image_tag` and `remote_build_dir` are regex-validated, `build_args` keys are regex-validated and each `k=v` token is `shlex`-quoted.
 - Remote destination/build/workdir paths are containment-checked: they must match a safe absolute-path regex and must not contain `..` segments. Payload collection skips symlinks so a payload entry cannot point outside the bundle/project root.
 
 A detached run started via `script_bundle_run` requires the container to define `docker.name`, and that name must pass the safe-container-name regex.
+
+### Single-machine install: `ssh_host: "local"`
+
+When Kikai runs on the *same* machine as the docker daemon (a single workstation or a
+standalone GPU box rather than a control host plus a training host), `remote_docker_run`,
+`remote_docker_build` and `remote_docker_teardown` accept the literal `ssh_host: "local"`.
+The adapter then invokes `docker` directly as an argv list — **no ssh, no shell** — instead
+of composing a remote command string:
+
+```json
+{
+  "operation": "bench_smi",
+  "adapter": "remote_docker_run",
+  "ssh_host": "local",
+  "image": "nvcr.io/nvidia/pytorch:24.10-py3",
+  "command": ["nvidia-smi", "-L"]
+}
+```
+
+The point is that the machine does not need ssh credentials for *itself*. Making a host
+ssh into its own account means planting a key that grants full local access, so `local`
+takes the direct path instead.
+
+Everything else is unchanged: `local` skips only the ssh-host charset check (there is no
+ssh argument to protect), and every other field — `image`, `gpus`, `network`, `name`,
+`workdir`, `volumes`, `ports`, env keys, `image_tag`, `remote_build_dir`, `build_args`
+keys, `..` containment — is validated exactly as on the remote path. Because the argv path
+never touches a shell, values are passed as separate argv elements rather than
+`shlex`-quoted; each `${NAME}` reference is resolved once and the resolved value that
+passed validation is the value handed to docker.
+
+`remote_docker_build` with `ssh_host: "local"` writes the Dockerfile straight to
+`remote_build_dir` on the local filesystem instead of piping it over ssh.
+
+Not (yet) local-aware: `remote_docker_logs`, `remote_file_push`, `remote_file_fetch` and
+`remote_kikai_exec` still require a real ssh host. On a single machine the first three have
+direct equivalents (`docker logs`, a filesystem copy) and `remote_kikai_exec` is moot —
+the checkout is already there.
 
 ### One-command launch
 

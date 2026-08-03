@@ -7,6 +7,15 @@ pre-1.0, so minor versions may contain breaking API changes.
 ## [Unreleased]
 
 ### Added
+- `ssh_host: "local"` for `remote_docker_run` / `remote_docker_build` /
+  `remote_docker_teardown`: when Kikai runs on the same machine as the docker
+  daemon, docker is invoked directly as an argv list (no ssh, no shell) so a
+  single-machine install does not need ssh credentials for its own host. All
+  other field validation is unchanged.
+- `remote_docker_run` `detach` / `ports`: start a long-lived service container
+  (`docker run -d`, no `--rm`, `name` required so it stays tearable-down) and
+  publish `host:container` port pairs, so a resident service no longer needs a
+  hand-written `docker run`.
 - HTTP control server (`kikai server start`): project/experiment/run registry
   over one endpoint, typed run submission (agents never touch Docker/SSH),
   columnar metrics, artifact streaming, and a no-build web dashboard.
