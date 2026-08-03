@@ -703,13 +703,15 @@ def execute_remote_docker_teardown_operation(request: dict[str, Any]) -> dict[st
     `docker rm -f` each (unless `list_only`). ssh_host is regex-validated and each selected
     name is re-checked against _SAFE_CONTAINER_NAME before removal. This is the kikai-native
     way to free a GPU held by a dead/orphaned run when TaskStop only killed the local ssh."""
-    ssh_host = require_safe_ssh_host(
-        require_string(
-            request.get("ssh_host"),
-            "operation.remote_ssh_host_missing",
-            "remote_docker_teardown request.ssh_host is required",
-        )
+    # "local" mirrors remote_docker_run: the server host IS the docker host,
+    # so docker is invoked directly (argv, no shell, no ssh).
+    raw_host = require_string(
+        request.get("ssh_host"),
+        "operation.remote_ssh_host_missing",
+        "remote_docker_teardown request.ssh_host is required",
     )
+    local_mode = raw_host == "local"
+    ssh_host = raw_host if local_mode else require_safe_ssh_host(raw_host)
     explicit = request.get("container_names") or []
     if not isinstance(explicit, list):
         raise OperationError("operation.remote_docker_teardown_invalid", "container_names must be a list", {})
@@ -718,8 +720,10 @@ def execute_remote_docker_teardown_operation(request: dict[str, Any]) -> dict[st
     list_only = bool(request.get("list_only"))
     ssh_bin = os.environ.get("KIKAI_SSH_BIN", "ssh")
 
+    ps_fmt = "{{.Names}}|{{.State}}|{{.Status}}|{{.Image}}|{{.RunningFor}}"
     listing = subprocess.run(
-        [ssh_bin, ssh_host, "docker ps -a --format '{{.Names}}|{{.State}}|{{.Status}}|{{.Image}}|{{.RunningFor}}'"],
+        ["docker", "ps", "-a", "--format", ps_fmt] if local_mode
+        else [ssh_bin, ssh_host, f"docker ps -a --format '{ps_fmt}'"],
         check=False, text=True, capture_output=True,
     )
     if listing.returncode != 0:
@@ -756,7 +760,10 @@ def execute_remote_docker_teardown_operation(request: dict[str, Any]) -> dict[st
             if not _SAFE_CONTAINER_NAME.match(name):
                 results.append({"name": name, "skipped": "unsafe_name"})
                 continue
-            rm = subprocess.run([ssh_bin, ssh_host, f"docker rm -f {name}"], check=False, text=True, capture_output=True)
+            rm = subprocess.run(
+                ["docker", "rm", "-f", name] if local_mode
+                else [ssh_bin, ssh_host, f"docker rm -f {name}"],
+                check=False, text=True, capture_output=True)
             results.append({"name": name, "returncode": rm.returncode, "removed": rm.returncode == 0,
                             "stderr": rm.stderr.strip()[:200] if rm.returncode != 0 else ""})
     return {
@@ -895,10 +902,13 @@ def execute_remote_docker_build_operation(request: dict[str, Any]) -> dict[str, 
     `pip install` is unnecessary. ssh_host, image_tag and remote_build_dir are
     regex-validated, build_arg keys are regex-validated and each k=v token is shlex-quoted,
     to keep the shell-injection surface minimal."""
-    ssh_host = require_safe_ssh_host(
-        require_string(request.get("ssh_host"), "operation.remote_ssh_host_missing",
-                       "remote_docker_build request.ssh_host is required")
-    )
+    # "local" mirrors remote_docker_run/remote_docker_teardown: the server host IS the
+    # docker host, so write the Dockerfile and run docker directly (argv, no shell,
+    # no ssh) — self-ssh would need credentials we refuse to plant on the host.
+    raw_host = require_string(request.get("ssh_host"), "operation.remote_ssh_host_missing",
+                              "remote_docker_build request.ssh_host is required")
+    local_mode = raw_host == "local"
+    ssh_host = raw_host if local_mode else require_safe_ssh_host(raw_host)
     image_tag = resolve_text_ref(
         require_string(request.get("image_tag"), "operation.remote_docker_build_tag_missing",
                        "remote_docker_build request.image_tag is required")
@@ -927,6 +937,7 @@ def execute_remote_docker_build_operation(request: dict[str, Any]) -> dict[str, 
         raise OperationError("operation.remote_docker_build_invalid_build_args",
                              "remote_docker_build build_args must be a dict of str->str",
                              {})
+    build_arg_pairs: list[tuple[str, str]] = []
     build_arg_parts: list[str] = []
     for k, v in build_args.items():
         ks = str(k)
@@ -935,30 +946,50 @@ def execute_remote_docker_build_operation(request: dict[str, Any]) -> dict[str, 
                                  "remote_docker_build build_arg key is not a safe name",
                                  {"key": ks})
         vs = resolve_text_ref(str(v))
+        build_arg_pairs.append((ks, vs))
         build_arg_parts.append(f"--build-arg {shlex.quote(f'{ks}={vs}')}")
     build_args_str = " ".join(build_arg_parts)
     no_cache_flag = "--no-cache" if bool(request.get("no_cache")) else ""
 
-    ssh_bin = os.environ.get("KIKAI_SSH_BIN", "ssh")
-    subprocess.run([ssh_bin, ssh_host, f"mkdir -p {remote_build_dir}"],
-                   check=False, text=True, capture_output=True)
-    write = subprocess.run(
-        [ssh_bin, ssh_host, f"cat > {remote_build_dir}/Dockerfile"],
-        input=dockerfile_content, text=True, capture_output=True, check=False,
-    )
-    if write.returncode != 0:
-        raise OperationError("operation.remote_docker_build_dockerfile_write_failed",
-                             "remote_docker_build failed to write Dockerfile to remote",
-                             {"remote_build_dir": remote_build_dir,
-                              "stderr": (write.stderr or "")[-2000:]})
+    if local_mode:
+        try:
+            os.makedirs(remote_build_dir, exist_ok=True)
+            with open(os.path.join(remote_build_dir, "Dockerfile"), "w") as fh:
+                fh.write(dockerfile_content)
+        except OSError as exc:
+            raise OperationError("operation.remote_docker_build_dockerfile_write_failed",
+                                 "remote_docker_build failed to write Dockerfile locally",
+                                 {"remote_build_dir": remote_build_dir,
+                                  "stderr": str(exc)[-2000:]}) from exc
+        build_argv = ["docker", "build"]
+        if no_cache_flag:
+            build_argv.append("--no-cache")
+        for ks, vs in build_arg_pairs:
+            build_argv += ["--build-arg", f"{ks}={vs}"]
+        build_argv += ["-t", image_tag, "-f", os.path.join(remote_build_dir, "Dockerfile"),
+                       remote_build_dir]
+        build = subprocess.run(build_argv, text=True, capture_output=True, check=False)
+    else:
+        ssh_bin = os.environ.get("KIKAI_SSH_BIN", "ssh")
+        subprocess.run([ssh_bin, ssh_host, f"mkdir -p {remote_build_dir}"],
+                       check=False, text=True, capture_output=True)
+        write = subprocess.run(
+            [ssh_bin, ssh_host, f"cat > {remote_build_dir}/Dockerfile"],
+            input=dockerfile_content, text=True, capture_output=True, check=False,
+        )
+        if write.returncode != 0:
+            raise OperationError("operation.remote_docker_build_dockerfile_write_failed",
+                                 "remote_docker_build failed to write Dockerfile to remote",
+                                 {"remote_build_dir": remote_build_dir,
+                                  "stderr": (write.stderr or "")[-2000:]})
 
-    build_cmd = (
-        f"docker build {no_cache_flag} {build_args_str} -t {image_tag} "
-        f"-f {remote_build_dir}/Dockerfile {remote_build_dir}"
-    )
-    build = subprocess.run(
-        [ssh_bin, ssh_host, build_cmd], text=True, capture_output=True, check=False
-    )
+        build_cmd = (
+            f"docker build {no_cache_flag} {build_args_str} -t {image_tag} "
+            f"-f {remote_build_dir}/Dockerfile {remote_build_dir}"
+        )
+        build = subprocess.run(
+            [ssh_bin, ssh_host, build_cmd], text=True, capture_output=True, check=False
+        )
     stdout = build.stdout or ""
     stderr = build.stderr or ""
     if build.returncode != 0:
@@ -988,10 +1019,12 @@ def execute_remote_docker_run_operation(request: dict[str, Any]) -> dict[str, An
     ports and env keys are all regex-validated (and env values are shlex-quoted).
     With `detach: true` this instead starts a long-lived service container (`docker run -d`,
     no `--rm`) and returns its container id; `ports` publishes host:container port pairs."""
-    ssh_host = require_safe_ssh_host(
-        require_string(request.get("ssh_host"), "operation.remote_ssh_host_missing",
-                       "remote_docker_run request.ssh_host is required")
-    )
+    # "local": the kikai server host IS the target host, so run docker directly
+    # (argv list, no shell, no ssh) — self-ssh needs credentials we refuse to plant.
+    raw_host = require_string(request.get("ssh_host"), "operation.remote_ssh_host_missing",
+                              "remote_docker_run request.ssh_host is required")
+    local_mode = raw_host == "local"
+    ssh_host = raw_host if local_mode else require_safe_ssh_host(raw_host)
     image = resolve_text_ref(
         require_string(request.get("image"), "operation.remote_docker_run_image_missing",
                        "remote_docker_run request.image is required")
@@ -1051,6 +1084,11 @@ def execute_remote_docker_run_operation(request: dict[str, Any]) -> dict[str, An
     if not isinstance(env, dict):
         raise OperationError("operation.remote_docker_run_invalid_env",
                              "remote_docker_run env must be a dict of str->str", {})
+    # Every ${ENV:...} reference is resolved EXACTLY once, and the resolved value is what
+    # both the remote command string and the local argv use. Re-resolving per code path
+    # would run the substitution over already-substituted text (and, worse, over text the
+    # validation below never saw).
+    env_pairs: list[tuple[str, str]] = []
     env_parts: list[str] = []
     for k, v in env.items():
         ks = str(k)
@@ -1058,12 +1096,14 @@ def execute_remote_docker_run_operation(request: dict[str, Any]) -> dict[str, An
             raise OperationError("operation.remote_docker_run_invalid_env_key",
                                  "remote_docker_run env key is not a safe environment name", {"key": ks})
         vs = resolve_text_ref(str(v))
+        env_pairs.append((ks, vs))
         env_parts.append(f"-e {ks}={shlex.quote(vs)}")
 
     volumes = request.get("volumes") or []
     if not isinstance(volumes, list):
         raise OperationError("operation.remote_docker_run_invalid_volumes",
                              "remote_docker_run volumes must be a list of host:container[:mode] strings", {})
+    volume_specs: list[str] = []
     volume_parts: list[str] = []
     for vol in volumes:
         vs = resolve_text_ref(str(vol))
@@ -1071,12 +1111,14 @@ def execute_remote_docker_run_operation(request: dict[str, Any]) -> dict[str, An
             raise OperationError("operation.remote_docker_run_invalid_volume",
                                  "remote_docker_run volume is not a safe host:container[:mode] string",
                                  {"volume": vs})
+        volume_specs.append(vs)
         volume_parts.append(f"-v {vs}")
 
     ports = request.get("ports") or []
     if not isinstance(ports, list):
         raise OperationError("operation.remote_docker_run_invalid_ports",
                              "remote_docker_run ports must be a list of host:container port strings", {})
+    port_specs: list[str] = []
     port_parts: list[str] = []
     for port in ports:
         ps = resolve_text_ref(str(port))
@@ -1084,6 +1126,7 @@ def execute_remote_docker_run_operation(request: dict[str, Any]) -> dict[str, An
             raise OperationError("operation.remote_docker_run_invalid_port",
                                  "remote_docker_run port is not a safe host:container port pair",
                                  {"port": ps})
+        port_specs.append(ps)
         port_parts.append(f"-p {ps}")
 
     # For a detached run docker returns as soon as the container is started, so the
@@ -1110,10 +1153,35 @@ def execute_remote_docker_run_operation(request: dict[str, Any]) -> dict[str, An
     parts.extend(shlex.quote(c) for c in command)
     remote_cmd = " ".join(parts)
 
-    ssh_bin = os.environ.get("KIKAI_SSH_BIN", "ssh")
+    if local_mode:
+        # The SAME already-validated, already-resolved pieces as `parts` above, assembled
+        # as a real argv list instead of a string: nothing passes through a shell, so no
+        # shlex quoting is needed (or wanted — a quote would become a literal character).
+        # The remote string path above is untouched.
+        argv: list[str] = ["docker", "run", "-d" if detach else "--rm"]
+        if gpus:
+            argv += ["--gpus", gpus]
+        if network:
+            argv += ["--network", network]
+        if name:
+            argv += ["--name", name]
+        if workdir:
+            argv += ["-w", workdir]
+        for ks, vs in env_pairs:
+            argv += ["-e", f"{ks}={vs}"]
+        for vs in volume_specs:
+            argv += ["-v", vs]
+        for ps in port_specs:
+            argv += ["-p", ps]
+        argv.append(image)
+        argv.extend(command)
+        exec_argv = argv
+    else:
+        ssh_bin = os.environ.get("KIKAI_SSH_BIN", "ssh")
+        exec_argv = [ssh_bin, ssh_host, remote_cmd]
     try:
         run = subprocess.run(
-            [ssh_bin, ssh_host, remote_cmd], text=True, capture_output=True, timeout=timeout_sec
+            exec_argv, text=True, capture_output=True, timeout=timeout_sec
         )
     except subprocess.TimeoutExpired as exc:
         raise OperationError("operation.remote_docker_run_timeout",
