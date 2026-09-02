@@ -7,6 +7,17 @@ pre-1.0, so minor versions may contain breaking API changes.
 ## [Unreleased]
 
 ### Added
+- `kikai publish <name> --project-root <p> --ops <op.json>…`: writes a registered
+  op sequence out as a self-contained directory (`run.sh`, `bundles/`,
+  `env.example`, `README.md`) that runs with Docker alone. Host-specific values
+  become shell variables and `env:`/`${}` references are never resolved, so
+  registered secrets do not leave the lab. Ops whose adapter has no 1:1 docker
+  CLI form are excluded and reported in the envelope, `run.sh`, and the generated
+  README instead of being silently dropped.
+- `remote_docker_run` `detach` / `ports`: start a long-lived service container
+  (`docker run -d`, no `--rm`, `name` required so it stays tearable-down) and
+  publish `host:container` port pairs, so a resident service no longer needs a
+  hand-written `docker run`.
 - HTTP control server (`kikai server start`): project/experiment/run registry
   over one endpoint, typed run submission (agents never touch Docker/SSH),
   columnar metrics, artifact streaming, and a no-build web dashboard.
@@ -37,6 +48,16 @@ pre-1.0, so minor versions may contain breaking API changes.
   text/JSON content (`tail=true` for file tails; binary files return
   metadata only). CLI: `kikai remote artifacts <project> <run>
   [--path d --depth N | --file rel --tail]`.
+- **Run purge (`POST .../runs/{run}/artifacts/purge`)**: kikai empties a
+  finished run's run_dir itself, so the deletion is checked against its own
+  records rather than racing them. Dry-run by default (`would_delete[]` +
+  `total_bytes`); `keep` defaults to `metrics.jsonl` / `tensorboard`; refused
+  with 409 while the run is non-terminal (`run.purge_active_refused`) or still
+  has queued qc_op/probe work (`run.purge_qc_pending_refused` — the same
+  `pending_qc_steps` predicate that protects checkpoints from retention);
+  symlinks out of the run_dir are skipped, never followed. The purge is
+  recorded as an appended `kind: purge` ledger row plus a journal entry. CLI:
+  `kikai remote purge <project> <run> [--yes] [--keep NAME ...]`.
 - `GET .../runs/{run}/status` now exposes the full reconciler progress
   digest: `probes_done_steps`, `op_fail_counts`, `op_gave_up`, `last_error`,
   and recent `delivery_failures`.

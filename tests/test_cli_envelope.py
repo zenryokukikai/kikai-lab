@@ -28,6 +28,14 @@ def test_validate_missing_project_root_returns_json_failure(tmp_path):
     assert payload["next_actions"][0]["id"] == "create_registry_root"
 
 
+def test_project_root_argument_is_required():
+    result = run_cli("validate")
+
+    assert result.returncode == 2
+    assert "required" in result.stderr
+    assert "--project-root" in result.stderr
+
+
 def test_unknown_command_returns_json_failure():
     result = run_cli("unknown", "--json")
 

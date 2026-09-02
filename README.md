@@ -609,7 +609,7 @@ Long-running training runs on a separate GPU host. Kikai owns that lifecycle thr
 | `remote_file_push` | Push local files/dirs to the remote host over scp (dirs use `scp -r`). Used to sync the kikai-lab package to the remote checkout so `remote_kikai_exec` runs the latest adapters. |
 | `remote_file_fetch` | Pull remote files back to a local destination root over scp. |
 | `remote_docker_build` | Build a docker image on the remote host; the full Dockerfile is supplied inline (`dockerfile_content`) and piped over ssh. Bakes a derived training image so per-run `pip install` is unnecessary. |
-| `remote_docker_run` | One-off `docker run --rm` of a given image plus an argv `command` list on the remote host (benchmarks, NGC containers) without a kikai checkout there. |
+| `remote_docker_run` | One-off `docker run --rm` of a given image plus an argv `command` list on the remote host (benchmarks, NGC containers) without a kikai checkout there. With `detach: true` it instead starts a long-lived service container (`docker run -d`, no `--rm`, `name` required) and returns its container id; `ports: ["18080:8080"]` publishes host:container port pairs. |
 | `tensorboard_service` | `status` / `ensure-running` for a TensorBoard container resolved from `containers/<container_id>.yaml`; (re)starts it detached when the port/logdir does not match. |
 | `remote_kikai_exec` | Ship a bounded local Kikai project payload to the remote host and run a local operation template there (see [One-command launch](#one-command-launch)). |
 
@@ -618,7 +618,7 @@ Long-running training runs on a separate GPU host. Kikai owns that lifecycle thr
 These adapters interpolate values into a remote shell, so the request fields are validated before any subprocess runs (claims below match the code exactly):
 
 - `ssh_host` is validated in **every** remote adapter: it must match a strict charset and must not begin with `-`, because an ssh/scp argument that starts with `-` is parsed as an option (e.g. `-oProxyCommand=...` → local command execution).
-- `remote_docker_run` `gpus` is validated against `all` / `none` / `<int>` / `device=<ids>`; `image`, `network`, `name`, `workdir`, and `volumes` are regex-validated, env keys are regex-validated and env values are `shlex`-quoted, and the `command` is a list of argv strings (each `shlex`-quoted), not a shell string.
+- `remote_docker_run` `gpus` is validated against `all` / `none` / `<int>` / `device=<ids>`; `image`, `network`, `name`, `workdir`, and `volumes` are regex-validated, env keys are regex-validated and env values are `shlex`-quoted, and the `command` is a list of argv strings (each `shlex`-quoted), not a shell string. Each `ports` entry must be a plain `host:container` port pair (no bind address, publishing is `0.0.0.0` only), and a `detach: true` request must carry a `name` so `remote_docker_teardown` can always remove the container it leaves behind.
 - `remote_docker_teardown` `name_pattern` is matched with `re.fullmatch` (anchored — it must match the **whole** container name, not a substring, so e.g. `.` cannot select every container) and is length-capped at 200 chars; each selected name is re-checked against the safe-name regex before `docker rm -f`.
 - `remote_docker_build` `image_tag` and `remote_build_dir` are regex-validated, `build_args` keys are regex-validated and each `k=v` token is `shlex`-quoted.
 - Remote destination/build/workdir paths are containment-checked: they must match a safe absolute-path regex and must not contain `..` segments. Payload collection skips symlinks so a payload entry cannot point outside the bundle/project root.
@@ -676,6 +676,30 @@ kikai reconcile --project-root <registry> --run-id <run_id> --once
 ```
 
 `kikai serve` is a thin loop over the same single-pass logic (`kikai_lab.reconcile.reconcile_once`); `--once` makes them equivalent. Per-run errors are isolated — one failing run records its error and the pass continues to the next.
+
+## Publishing a kikai-independent package (`kikai publish`)
+
+A recipe that works in the lab often has to leave it. `kikai publish` writes a registered op
+sequence out as one self-contained directory that runs with nothing but Docker:
+
+```
+kikai publish <name> --project-root <registry> --ops op1.json op2.json [--out <dir>]
+```
+
+```
+publish/<name>/
+  bundles/<bundle_id>/…   the referenced script bundles, verified against bundle.json then copied
+  run.sh                  one `docker run` per op, in the order the --ops were given
+  env.example             host-specific values (mount sources, image names) — names only, no values
+  README.md               GPU / image / data-placement prerequisites, generated from the ops
+```
+
+`env:NAME` and `${NAME}` references are **never resolved** during publish, so registered secrets
+stay in the lab: they become shell variables and their names are listed in `env.example`. Ops whose
+adapter has no 1:1 docker CLI form (anything but `script_bundle_run` today) are excluded rather than
+mistranslated — each exclusion is reported in the command envelope's warnings, as a comment at that
+position in `run.sh`, and in a table in the generated `README.md`. A publish is a snapshot: it does
+not sync afterwards, the same way bundles are immutable.
 
 ## Decisions
 
