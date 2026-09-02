@@ -959,7 +959,8 @@ def execute_remote_docker_build_operation(request: dict[str, Any]) -> dict[str, 
         except OSError as exc:
             raise OperationError("operation.remote_docker_build_dockerfile_write_failed",
                                  "remote_docker_build failed to write Dockerfile locally",
-                                 {"remote_build_dir": remote_build_dir, "stderr": str(exc)[-2000:]})
+                                 {"remote_build_dir": remote_build_dir,
+                                  "stderr": str(exc)[-2000:]}) from exc
         build_argv = ["docker", "build"]
         if no_cache_flag:
             build_argv.append("--no-cache")
