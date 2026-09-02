@@ -7,6 +7,13 @@ pre-1.0, so minor versions may contain breaking API changes.
 ## [Unreleased]
 
 ### Added
+- `kikai publish <name> --project-root <p> --ops <op.json>…`: writes a registered
+  op sequence out as a self-contained directory (`run.sh`, `bundles/`,
+  `env.example`, `README.md`) that runs with Docker alone. Host-specific values
+  become shell variables and `env:`/`${}` references are never resolved, so
+  registered secrets do not leave the lab. Ops whose adapter has no 1:1 docker
+  CLI form are excluded and reported in the envelope, `run.sh`, and the generated
+  README instead of being silently dropped.
 - `remote_docker_run` `detach` / `ports`: start a long-lived service container
   (`docker run -d`, no `--rm`, `name` required so it stays tearable-down) and
   publish `host:container` port pairs, so a resident service no longer needs a

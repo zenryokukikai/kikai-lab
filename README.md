@@ -677,6 +677,30 @@ kikai reconcile --project-root <registry> --run-id <run_id> --once
 
 `kikai serve` is a thin loop over the same single-pass logic (`kikai_lab.reconcile.reconcile_once`); `--once` makes them equivalent. Per-run errors are isolated — one failing run records its error and the pass continues to the next.
 
+## Publishing a kikai-independent package (`kikai publish`)
+
+A recipe that works in the lab often has to leave it. `kikai publish` writes a registered op
+sequence out as one self-contained directory that runs with nothing but Docker:
+
+```
+kikai publish <name> --project-root <registry> --ops op1.json op2.json [--out <dir>]
+```
+
+```
+publish/<name>/
+  bundles/<bundle_id>/…   the referenced script bundles, verified against bundle.json then copied
+  run.sh                  one `docker run` per op, in the order the --ops were given
+  env.example             host-specific values (mount sources, image names) — names only, no values
+  README.md               GPU / image / data-placement prerequisites, generated from the ops
+```
+
+`env:NAME` and `${NAME}` references are **never resolved** during publish, so registered secrets
+stay in the lab: they become shell variables and their names are listed in `env.example`. Ops whose
+adapter has no 1:1 docker CLI form (anything but `script_bundle_run` today) are excluded rather than
+mistranslated — each exclusion is reported in the command envelope's warnings, as a comment at that
+position in `run.sh`, and in a table in the generated `README.md`. A publish is a snapshot: it does
+not sync afterwards, the same way bundles are immutable.
+
 ## Decisions
 
 Decisions are first-class records managed inside the project as `decisions/<decision_id>.yaml` (`schema_version`, `kind: decision`, `decision_id`, `title`, `summary`, `status` one of `open` / `decided` / `superseded`, optional `decided_at` and `links`). kikai-lab owns the decision log; no external system is required.

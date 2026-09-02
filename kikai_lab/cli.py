@@ -28,6 +28,7 @@ from kikai_lab.operation import (
     load_operation,
     validate_guard_receipt,
 )
+from kikai_lab.publish import publish_operations
 from kikai_lab.remote_launch import build_script_bundle_launch_ops
 from kikai_lab.report import build_project_report, render_report_html
 from kikai_lab.server_config import set_server_value
@@ -232,6 +233,19 @@ def build_parser(command: str) -> argparse.ArgumentParser:
         ensure.add_argument("--port", type=int, default=None)
         ensure.add_argument("--write-operation", default=None)
         ensure.add_argument("--json", action="store_true")
+    elif command == "publish":
+        parser.add_argument("name")
+        parser.add_argument("--project-root", required=True)
+        parser.add_argument(
+            "--ops",
+            nargs="+",
+            required=True,
+            metavar="OP_JSON",
+            help="operation files; the given order IS the execution order",
+        )
+        parser.add_argument(
+            "--out", default=None, help="output directory (default: ./publish/<name>)"
+        )
     elif command == "reconcile":
         parser.add_argument("--project-root", required=True)
         parser.add_argument("--run-id", default=None)
@@ -264,6 +278,7 @@ def build_top_level_parser() -> argparse.ArgumentParser:
             "data-source",
             "server",
             "tensorboard",
+            "publish",
             "reconcile",
             "remote",
             "serve",
@@ -858,6 +873,35 @@ def command_tensorboard(args: argparse.Namespace) -> int:
         return operation_error(exc)
 
 
+def command_publish(args: argparse.Namespace) -> int:
+    """Write the given op sequence out as a kikai-independent package (issue #63)."""
+    project_root = Path(args.project_root)
+    if not project_root.exists():
+        return project_root_missing(project_root)
+    out_dir = Path(args.out) if args.out else Path("publish") / args.name
+    try:
+        result, plan = publish_operations(
+            name=args.name,
+            project_root=project_root,
+            operation_paths=[Path(item) for item in args.ops],
+            out_dir=out_dir,
+        )
+    except OperationError as exc:
+        return operation_error(exc)
+    # 除外した op は envelope にも必ず出す。README だけに書いて黙って落とすのが一番まずい。
+    warnings = [
+        error(
+            "publish.operation_excluded",
+            f"op {op.index}/{len(plan.ops)} '{op.operation}' was not published: "
+            f"{op.skipped_reason}",
+            blocking=False,
+            details={"index": op.index, "operation": op.operation, "adapter": op.adapter},
+        )
+        for op in plan.skipped
+    ]
+    return emit(envelope(ok=True, data=result, warnings=warnings), 0)
+
+
 def command_reconcile(args: argparse.Namespace) -> int:
     project_root = Path(args.project_root)
     if not project_root.exists():
@@ -918,6 +962,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "data-source",
         "server",
         "tensorboard",
+        "publish",
         "reconcile",
         "serve",
     }:
@@ -950,6 +995,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return command_server(args)
     if command == "tensorboard":
         return command_tensorboard(args)
+    if command == "publish":
+        return command_publish(args)
     if command == "reconcile":
         return command_reconcile(args)
     if command == "serve":

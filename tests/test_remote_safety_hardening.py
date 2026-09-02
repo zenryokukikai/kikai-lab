@@ -8,12 +8,12 @@
 """
 
 from kikai_lab.operation import (
-    _SAFE_CONTAINER_NAME,
     _SAFE_DOCKER_GPUS,
     _SAFE_DOCKER_NETWORK,
     _SAFE_DOCKER_PATH,
     _SAFE_IMAGE_TAG,
     _SAFE_SSH_HOST,
+    SAFE_CONTAINER_NAME,
     OperationError,
     execute_docker_container_restart_operation,
 )
@@ -22,7 +22,7 @@ from kikai_lab.report import render_report_html
 
 def test_safety_regexes_reject_trailing_newline():
     cases = [
-        (_SAFE_CONTAINER_NAME, "run1"),
+        (SAFE_CONTAINER_NAME, "run1"),
         (_SAFE_IMAGE_TAG, "img:tag"),
         (_SAFE_DOCKER_NETWORK, "host"),
         (_SAFE_DOCKER_PATH, "/work/dir"),

@@ -644,7 +644,7 @@ def execute_remote_file_fetch_operation(request: dict[str, Any]) -> dict[str, An
 # These validate values that are interpolated into a remote shell string, so they must
 # anchor with \Z (true end-of-string), NOT $ -- $ also matches just before a trailing
 # newline, so e.g. "run1\n" would pass and inject a newline into the remote command.
-_SAFE_CONTAINER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+SAFE_CONTAINER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 _SAFE_IMAGE_TAG = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:/-]{0,127}\Z")
 _SAFE_REMOTE_BUILD_DIR = re.compile(r"^/[A-Za-z0-9_./-]+\Z")
 _SAFE_DOCKER_PATH = re.compile(r"^/[A-Za-z0-9_.\-/]+\Z")
@@ -701,7 +701,7 @@ def execute_remote_docker_teardown_operation(request: dict[str, Any]) -> dict[st
     containers by explicit `container_names` and/or `name_pattern` (regex, length-bounded
     and matched with re.fullmatch so it must match the WHOLE name — not a substring), then
     `docker rm -f` each (unless `list_only`). ssh_host is regex-validated and each selected
-    name is re-checked against _SAFE_CONTAINER_NAME before removal. This is the kikai-native
+    name is re-checked against SAFE_CONTAINER_NAME before removal. This is the kikai-native
     way to free a GPU held by a dead/orphaned run when TaskStop only killed the local ssh."""
     # "local" mirrors remote_docker_run: the server host IS the docker host,
     # so docker is invoked directly (argv, no shell, no ssh).
@@ -757,7 +757,7 @@ def execute_remote_docker_teardown_operation(request: dict[str, Any]) -> dict[st
     results: list[dict[str, Any]] = []
     if not list_only:
         for name in selected:
-            if not _SAFE_CONTAINER_NAME.match(name):
+            if not SAFE_CONTAINER_NAME.match(name):
                 results.append({"name": name, "skipped": "unsafe_name"})
                 continue
             rm = subprocess.run(
@@ -798,7 +798,7 @@ def execute_remote_docker_logs_operation(request: dict[str, Any]) -> dict[str, A
             "remote_docker_logs request.container_name is required",
         )
     )
-    if not _SAFE_CONTAINER_NAME.match(container_name):
+    if not SAFE_CONTAINER_NAME.match(container_name):
         raise OperationError(
             "operation.remote_docker_logs_invalid_name",
             "remote_docker_logs container_name is not a safe container name",
@@ -1057,7 +1057,7 @@ def execute_remote_docker_run_operation(request: dict[str, Any]) -> dict[str, An
     name = request.get("name")
     if name is not None:
         name = str(name)
-        if not _SAFE_CONTAINER_NAME.match(name):
+        if not SAFE_CONTAINER_NAME.match(name):
             raise OperationError("operation.remote_docker_run_invalid_name",
                                  "remote_docker_run name is not a safe container name", {"name": name})
 
@@ -1219,7 +1219,7 @@ def execute_docker_container_restart_operation(request: dict[str, Any]) -> dict[
     )
     # container_id becomes a path component (containers/<id>.yaml); reject anything with
     # '/', '..', or a non-alphanumeric leading char so it cannot traverse out of the dir.
-    if not _SAFE_CONTAINER_NAME.fullmatch(container_id):
+    if not SAFE_CONTAINER_NAME.fullmatch(container_id):
         raise OperationError(
             "operation.docker_container_restart_invalid",
             "docker_container_restart container_id is not a safe registry id",
@@ -1275,7 +1275,7 @@ def execute_run_dir_chown_operation(request: dict[str, Any]) -> dict[str, Any]:
         "operation.run_dir_chown_invalid",
         "run_dir_chown request.container_id is required",
     )
-    if not _SAFE_CONTAINER_NAME.fullmatch(container_id):
+    if not SAFE_CONTAINER_NAME.fullmatch(container_id):
         raise OperationError(
             "operation.run_dir_chown_invalid",
             "run_dir_chown container_id is not a safe registry id",
@@ -1785,7 +1785,7 @@ def kikai_identity_env(request: dict[str, Any], container_id: str) -> list[str]:
     for key, value in identity:
         if key in existing_keys:
             continue
-        if not _SAFE_CONTAINER_NAME.match(key):
+        if not SAFE_CONTAINER_NAME.match(key):
             continue
         command.extend(["-e", f"{key}={value}"])
     return command
@@ -1868,7 +1868,7 @@ def _composed_docker_name(
     if ephemeral and isinstance(suffix, str) and suffix:
         # Per-invocation uniqueness: mangle non-safe chars, length-bound the suffix
         # so the composed name always stays under docker's 63-char --name limit
-        # and matches _SAFE_CONTAINER_NAME.
+        # and matches SAFE_CONTAINER_NAME.
         safe_suffix = re.sub(r"[^A-Za-z0-9_.-]", "_", suffix)[:50]
         max_base = 63 - len(safe_suffix) - 2   # 2 for "__"
         base = resolved_name[: max(1, max_base)]
@@ -1931,7 +1931,7 @@ def docker_run_command(
     # (one-run-one-named-container). Without this, `docker run --rm` is anonymous
     # and teardown-by-name silently matches nothing, orphaning the GPU.
     resolved_name = _composed_docker_name(container, container_id, request)
-    if resolved_name and _SAFE_CONTAINER_NAME.match(resolved_name):
+    if resolved_name and SAFE_CONTAINER_NAME.match(resolved_name):
         command.extend(["--name", resolved_name])
     command.extend(docker_attribution_labels(request, container_id))
     gpus = container.get("gpus")
@@ -2367,7 +2367,7 @@ def execute_docker_run_operation(request: dict[str, Any]) -> dict[str, Any]:
         composed_name = _composed_docker_name(container, container_id, request)
     except OperationError:
         composed_name = None
-    if composed_name is not None and not _SAFE_CONTAINER_NAME.match(composed_name):
+    if composed_name is not None and not SAFE_CONTAINER_NAME.match(composed_name):
         composed_name = None
     preflight_name = composed_name
     found, data = False, []
@@ -2498,7 +2498,7 @@ def execute_docker_run_detached_operation(request: dict[str, Any]) -> dict[str, 
             "detached script_bundle_run requires the container to define docker.name",
             {"container_id": container_id},
         )
-    if not _SAFE_CONTAINER_NAME.match(container_name):
+    if not SAFE_CONTAINER_NAME.match(container_name):
         raise OperationError(
             "operation.script_bundle_run_detach_requires_name",
             "detached script_bundle_run docker.name is not a safe container name",
